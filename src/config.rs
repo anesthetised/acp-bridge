@@ -161,9 +161,23 @@ impl ConfigFile {
 #[cfg(test)]
 mod tests {
     use super::{ConfigFile, LlmSection};
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes tests that mutate process-global environment variables.
+    /// Cargo runs a test binary's unit tests in parallel threads, and
+    /// `std::env::set_var` / `remove_var` are process-global — without
+    /// this lock the two `LLM_SYSTEM_PROMPT` tests race and fail roughly
+    /// every other `cargo test --lib` run (observed on clean v0.9.1).
+    /// Poison-tolerant so a panicking test does not cascade into the next.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_guard() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     #[test]
     fn llm_config_uses_system_prompt_from_file_when_env_missing() {
+        let _env = env_guard();
         std::env::remove_var("LLM_SYSTEM_PROMPT");
 
         let cfg = ConfigFile {
@@ -179,6 +193,7 @@ mod tests {
 
     #[test]
     fn llm_config_env_system_prompt_overrides_file() {
+        let _env = env_guard();
         std::env::set_var("LLM_SYSTEM_PROMPT", "from env");
 
         let cfg = ConfigFile {

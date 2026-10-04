@@ -1117,6 +1117,17 @@ fn execute_git(working_dir: &Path, args: &[&str]) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes tests that mutate process-global environment variables.
+    /// Same rationale as the ENV_LOCK in src/config.rs: parallel unit
+    /// test threads + process-global `std::env` mutation race otherwise
+    /// (the two `LLM_WEB_ALLOWLIST` tests fail nondeterministically).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_guard() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     fn tmpwd() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1204,6 +1215,9 @@ mod tests {
     #[test]
     fn web_fetch_blocks_when_allowlist_empty() {
         // Default: no allowlist → every request is blocked.
+        // Guarded: this test races with web_fetch_rejects_non_http_schemes
+        // over the process-global LLM_WEB_ALLOWLIST variable.
+        let _env = env_guard();
         std::env::remove_var("LLM_WEB_ALLOWLIST");
         let result = execute_web_fetch("https://example.com/");
         assert!(
@@ -1214,6 +1228,7 @@ mod tests {
 
     #[test]
     fn web_fetch_rejects_non_http_schemes() {
+        let _env = env_guard();
         std::env::set_var("LLM_WEB_ALLOWLIST", "example.com");
         let result = execute_web_fetch("file:///etc/passwd");
         assert!(result.contains("not allowed"), "got: {result}");
