@@ -184,6 +184,11 @@ impl TestHarness {
             .env("LLM_API_KEY", "test-key")
             .env("LLM_TIMEOUT", "10")
             .env("LLM_MAX_HISTORY_TURNS", "5")
+            // Persistence writes to the user's real session DB by
+            // default (issue #17) — tests must stay isolated from it
+            // and from each other. Persistence tests pass their own
+            // ACP_SESSION_DB instead.
+            .env("ACP_PERSISTENCE", "off")
             .env("RUST_LOG", "acp_bridge=debug");
         for (k, v) in extra_env {
             cmd.env(k, v);
@@ -2169,4 +2174,251 @@ async fn test_sigterm_exits_gracefully() {
         std::fs::read_to_string(std::env::temp_dir().join("acp_sigterm_test.log"))
             .unwrap_or_default()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #17: session persistence — kill and restore across a restart
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_session_load_replays_history_after_restart() {
+    // The full acceptance scenario: a session with a completed tool
+    // round survives a SIGTERM + respawn. session/load replays the
+    // timeline (user chunk → tool_call → tool_call_update → agent
+    // chunk) BEFORE the response, and a follow-up prompt proves the
+    // restored session carries real context — the mock answers based on
+    // the last tool result in history.
+    let db_path = std::env::temp_dir().join(format!(
+        "acp_persist_test_{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let make_router = || -> Router {
+        Router::new()
+            .route("/v1/models", get(mock_models))
+            .route("/api/tags", get(mock_ollama_tags))
+            .route(
+                "/v1/chat/completions",
+                post(|req: Request<Body>| async move {
+                    let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                    let last_tool_result = body["messages"].as_array().and_then(|msgs| {
+                        msgs.iter()
+                            .rev()
+                            .find(|m| m["role"] == "tool")
+                            .and_then(|m| m["content"].as_str())
+                            .map(String::from)
+                    });
+                    match last_tool_result {
+                        // Round 1: request a list_dir tool call.
+                        None => axum::Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": "call_persist",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "list_dir",
+                                            "arguments": "{\"path\": \".\"}"
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }]
+                        }))
+                        .into_response(),
+                        // Final answer keyed on the tool result content —
+                        // proves the restored session carries context.
+                        Some(r) => axum::Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": format!("context check: {}", &r[..r.len().min(20)])
+                                },
+                                "finish_reason": "stop"
+                            }]
+                        }))
+                        .into_response(),
+                    }
+                }),
+            )
+    };
+
+    let spawn_agent = |db_path: &std::path::Path| {
+        let port = free_port();
+        // Each agent spawn gets its own mock backend server; the mock
+        // answers are stateless (derived from the request body), so the
+        // two agent lifetimes see consistent behavior. The std listener
+        // is bound synchronously (guaranteed before the agent spawns and
+        // probes) and converted for the async serve.
+        let std_listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind mock");
+        std_listener.set_nonblocking(true).expect("set_nonblocking");
+        let listener = tokio::net::TcpListener::from_std(std_listener).expect("async listener");
+        tokio::spawn(async move {
+            axum::serve(listener, make_router()).await.unwrap();
+        });
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_acp-bridge"));
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .env("LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
+            .env("LLM_MODEL", "test-model")
+            .env("LLM_API_KEY", "test-key")
+            .env("ACP_SESSION_DB", db_path.display().to_string());
+        let mut child = cmd.spawn().expect("spawn acp-bridge");
+        let reader = BufReader::new(child.stdout.take().expect("stdout"));
+        std::thread::sleep(Duration::from_millis(700));
+        (child, reader)
+    };
+
+    // --- Session 1: create, run one tool round, SIGTERM. ---
+    let (child1, reader1) = spawn_agent(&db_path);
+    let mut h1 = TestHarness {
+        child: child1,
+        reader: reader1,
+        _server_handle: tokio::spawn(async {}),
+    };
+
+    h1.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h1.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h1.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"list it"}]}
+    }));
+    let (_, response) = h1.read_until_response(2);
+    assert_eq!(response["result"]["status"], "completed");
+
+    // SIGTERM — graceful since #18, but the persistence contract must
+    // hold for hard kills too (per-round saves).
+    let pid = h1.child.id() as libc::c_int;
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match h1.child.try_wait().expect("try_wait") {
+                Some(s) => break s,
+                None => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("child did not exit");
+    assert!(status.success(), "expected graceful exit, got {status}");
+    drop(h1);
+
+    // --- Session 2: respawn, session/load, assert replay + context. ---
+    let (child2, reader2) = spawn_agent(&db_path);
+    let mut h2 = TestHarness {
+        child: child2,
+        reader: reader2,
+        _server_handle: tokio::spawn(async {}),
+    };
+
+    h2.send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}));
+    let init = h2.read_line();
+    assert_eq!(
+        init["result"]["agentCapabilities"]["loadSession"], true,
+        "loadSession must be advertised with persistence on: {init}"
+    );
+
+    h2.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/load",
+        "params":{"sessionId":&sid,"cwd":"/tmp"}
+    }));
+
+    // Spec order: ALL replay updates precede the load response.
+    let (notifications, response) = h2.read_until_response(2);
+    let replay_kinds: Vec<&str> = notifications
+        .iter()
+        .filter_map(|m| m["params"]["update"]["sessionUpdate"].as_str())
+        .collect();
+
+    // Full-timeline replay: user text, tool call start + completion, agent text.
+    assert!(
+        replay_kinds.contains(&"user_message_chunk"),
+        "expected user replay; got {replay_kinds:?}"
+    );
+    assert!(
+        replay_kinds.contains(&"tool_call"),
+        "expected tool_call replay; got {replay_kinds:?}"
+    );
+    let tool_updates: Vec<&Value> = notifications
+        .iter()
+        .filter(|m| m["params"]["update"]["sessionUpdate"] == "tool_call_update")
+        .map(|m| &m["params"]["update"])
+        .collect();
+    assert!(
+        tool_updates
+            .iter()
+            .any(|u| u["toolCallId"] == "call_persist" && u["status"] == "completed"),
+        "expected completed tool_call_update for call_persist; got {tool_updates:?}"
+    );
+    assert!(
+        replay_kinds.contains(&"agent_message_chunk"),
+        "expected agent replay; got {replay_kinds:?}"
+    );
+    // The load response is an empty result object (per spec).
+    assert_eq!(response["result"], json!({}));
+
+    // Prove real context was restored: the final prompt's answer is
+    // derived from the persisted tool result.
+    h2.send(&json!({
+        "jsonrpc":"2.0","id":3,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"continue"}]}
+    }));
+    let (_, response) = h2.read_until_response(3);
+    assert_eq!(response["result"]["status"], "completed");
+    let text = response["result"]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.starts_with("context check: "),
+        "the restored session must feed prior tool results to the LLM; got: {text}"
+    );
+
+    // session/end removes the persisted snapshot.
+    h2.send(&json!({"jsonrpc":"2.0","id":4,"method":"session/end","params":{"sessionId":&sid}}));
+    let _ = h2.read_line();
+
+    h2.shutdown();
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_persistence_opt_out_hides_capabilities() {
+    // ACP_PERSISTENCE=off: loadSession is NOT advertised, and
+    // session/load keeps the historical no_persistence rejection.
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_router(),
+        &[("ACP_PERSISTENCE", "off")],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}));
+    let init = h.read_line();
+    assert!(
+        init["result"]["agentCapabilities"]["loadSession"].is_null(),
+        "loadSession must be absent with persistence off: {init}"
+    );
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/load",
+        "params":{"sessionId":"whatever","cwd":"/tmp"}
+    }));
+    let (_, resp) = h.read_until_response(2);
+    assert_eq!(resp["error"]["data"]["reason"], "no_persistence");
+
+    h.shutdown();
 }

@@ -11,6 +11,7 @@ use acp_bridge::hardware;
 use acp_bridge::llm;
 use acp_bridge::protocol::{AcpError, JsonRpcRequest, ProtocolVersion, RequestId};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -128,7 +129,43 @@ async fn main() {
     probe_backend(&config).await;
 
     // Build shared state
-    let state = AppState::new(config);
+    // Session persistence (issue #17): SQLite store unless disabled via
+    // ACP_PERSISTENCE=off. Opening or pruning failures degrade to no
+    // persistence — the loadSession capability is simply not advertised,
+    // so spec-compliant Clients never attempt restore.
+    let persistence_disabled = matches!(
+        std::env::var("ACP_PERSISTENCE").as_deref(),
+        Ok("off") | Ok("false") | Ok("0")
+    );
+    let store = if persistence_disabled {
+        None
+    } else {
+        let db_path = std::env::var("ACP_SESSION_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| acp_bridge::session_store::default_db_path());
+        match acp_bridge::session_store::SessionStore::open(&db_path) {
+            Ok(s) => {
+                let keep = std::env::var("ACP_SESSION_RETENTION")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(100);
+                match s.prune(keep) {
+                    Ok(n) if n > 0 => {
+                        info!(deleted = n, keep, "Pruned old persisted sessions")
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "Session retention prune failed"),
+                }
+                Some(Arc::new(s))
+            }
+            Err(e) => {
+                warn!(error = %e, path = %db_path.display(), "Failed to open session store; persistence disabled");
+                None
+            }
+        }
+    };
+
+    let state = AppState::with_store(config, store);
 
     // Spawn idle session cleanup task
     let idle_timeout = state.config.session_idle_timeout_secs;
@@ -313,7 +350,11 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                 // run_acp_loop the Arc has refcount 1, so
                                 // make_mut never actually clones.
                                 Arc::make_mut(&mut state).protocol_version = negotiated;
-                                let result = engine::initialize(&state.config, negotiated);
+                                let result = engine::initialize(
+                                    &state.config,
+                                    negotiated,
+                                    state.store.is_some(),
+                                );
                                 acp::send_response(&id, result);
                             }
                             "session/new" => {
@@ -385,17 +426,47 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                 );
                             }
                             "session/load" | "session/resume" => {
-                                // acp-bridge has no persistence layer; it does not
-                                // advertise `loadSession` in `agentCapabilities`, so a
-                                // spec-compliant Client should not call this. We
-                                // return `-32001` (application error) with a stable
-                                // `data.reason` so Clients can branch on it.
-                                acp::send_error_with_data(
-                                    &id,
-                                    -32001,
-                                    "acp-bridge has no persistence layer; session/load and session/resume are unavailable",
-                                    json!({ "reason": "no_persistence" }),
-                                );
+                                // Both methods restore a persisted session.
+                                // `session/load` additionally replays the
+                                // conversation as session/update
+                                // notifications BEFORE the response (spec
+                                // order); `session/resume` restores context
+                                // without replay. Requires persistence —
+                                // without it the historical `-32001
+                                // no_persistence` rejection stands.
+                                let Some(store) = &state.store else {
+                                    acp::send_error_with_data(
+                                        &id,
+                                        -32001,
+                                        "acp-bridge has no persistence layer; session/load and session/resume are unavailable",
+                                        json!({ "reason": "no_persistence" }),
+                                    );
+                                    continue;
+                                };
+                                let Some(session_id) = params.get("sessionId").and_then(|v| v.as_str()) else {
+                                    acp::send_error(&id, AcpError::MissingParam { field: "sessionId".into() }.code(), &AcpError::MissingParam { field: "sessionId".into() }.to_string());
+                                    continue;
+                                };
+                                let Some(cwd) = params.get("cwd").and_then(|v| v.as_str()) else {
+                                    acp::send_error(&id, AcpError::MissingParam { field: "cwd".into() }.code(), &AcpError::MissingParam { field: "cwd".into() }.to_string());
+                                    continue;
+                                };
+                                let replay = method == "session/load";
+                                match engine::session_restore(&state, replay, session_id, cwd, store) {
+                                    Ok(events) => {
+                                        // Spec order: the entire replay
+                                        // precedes the response.
+                                        for event in &events {
+                                            acp::notify_replay_event(
+                                                state.protocol_version,
+                                                session_id,
+                                                event,
+                                            );
+                                        }
+                                        acp::send_response(&id, json!({}));
+                                    }
+                                    Err(e) => acp::send_error(&id, e.code(), &e.to_string()),
+                                }
                             }
                             "session/delete" => {
                                 // v2 optional session method (advertised via

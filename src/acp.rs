@@ -7,6 +7,7 @@
 //! the historical API and are still the most common path because most
 //! existing Clients (Zed, JetBrains, ACP UI, Meuxe) speak v1 today.
 
+use crate::engine;
 use crate::protocol::{ProtocolVersion, RequestId};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -204,18 +205,7 @@ pub fn notify_tool_done(session_id: &str, tool_call_id: &str, status: &str, resu
     });
     if let Some(result) = result {
         if !result.is_empty() {
-            // Preview cap: the full result already reached the model via
-            // the session history; this bounds only the wire notification.
-            let text = if result.len() > TOOL_RESULT_MAX {
-                let mut cut = result[..TOOL_RESULT_MAX].to_string();
-                cut.push_str(&format!(
-                    "\n\n[truncated for display; {} more characters — the model received the full result]",
-                    result.len() - TOOL_RESULT_MAX
-                ));
-                cut
-            } else {
-                result.to_string()
-            };
+            let text = preview_result(result);
             body["content"] = json!([{
                 "type": "content",
                 "content": {"type": "text", "text": text}
@@ -224,6 +214,26 @@ pub fn notify_tool_done(session_id: &str, tool_call_id: &str, status: &str, resu
         }
     }
     send_session_update(session_id, body);
+}
+
+/// Display preview of a tool result for `tool_call_update` notifications:
+/// capped at [`TOOL_RESULT_MAX`] bytes on a CHAR boundary (results are
+/// arbitrary model output; a raw byte index would panic inside a
+/// multi-byte character — found in the field with Cyrillic text).
+fn preview_result(result: &str) -> String {
+    if result.len() <= TOOL_RESULT_MAX {
+        return result.to_string();
+    }
+    let mut boundary = TOOL_RESULT_MAX;
+    while !result.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let mut cut = result[..boundary].to_string();
+    cut.push_str(&format!(
+        "\n\n[truncated for display; {} more bytes — the model received the full result]",
+        result.len() - boundary
+    ));
+    cut
 }
 
 /// One entry in an `agent_plan` notification.
@@ -474,6 +484,40 @@ fn notify_tool_start_v2(session_id: &str, tool_call_id: &str, name: &str, args: 
     send_session_update(session_id, body);
 }
 
+/// Emit a replayed conversation entry for `session/load` (issue #17).
+/// Maps [`engine::ReplayEvent`] values onto the same session/update
+/// shapes a live turn produces, so Clients rebuild the turn timeline
+/// with their normal rendering path. Routed through the v1/v2
+/// dispatchers; tool entries appear as a completed `tool_call` /
+/// `tool_call_update` pair (start + result).
+pub fn notify_replay_event(
+    version: ProtocolVersion,
+    session_id: &str,
+    event: &engine::ReplayEvent,
+) {
+    use engine::ReplayEvent;
+    match event {
+        ReplayEvent::UserText(text) => {
+            send_session_update(
+                session_id,
+                json!({
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": text}
+                }),
+            );
+        }
+        ReplayEvent::AssistantText(text) => {
+            notify_text_for(version, session_id, text);
+        }
+        ReplayEvent::ToolCall { id, name, args } => {
+            notify_tool_start_for(version, session_id, id, name, args);
+        }
+        ReplayEvent::ToolResult { id, result } => {
+            notify_tool_done_for(version, session_id, id, "completed", Some(result));
+        }
+    }
+}
+
 /// Dispatch a tool-call update (status change or result delivery). The
 /// v1 and v2 shapes are both `tool_call_update` and same schema, so this
 /// dispatcher just routes.
@@ -669,6 +713,27 @@ pub fn notify_state_idle_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_result_respects_char_boundaries() {
+        // Regression (field crash): tool results are arbitrary model
+        // output; slicing at a raw byte index inside a multi-byte
+        // character panicked the whole agent (Cyrillic 'а' spans bytes
+        // 8191..8193 — exactly across the 8 KB cap).
+        let mut result = "x".repeat(TOOL_RESULT_MAX - 1);
+        result.push('а'); // Cyrillic 'а' = 2 bytes → len = TOOL_RESULT_MAX + 1
+        result.push_str("хвост");
+        let preview = preview_result(&result);
+        assert!(preview.len() <= TOOL_RESULT_MAX + 120, "cap exceeded");
+        assert!(preview.contains("[truncated for display"));
+        assert!(preview.ends_with("the model received the full result]"));
+        // The cut must be valid UTF-8 (any slicing panic would fail the
+        // test outright) and must not end mid-character.
+        assert!(preview.is_char_boundary(preview.len() - 2));
+
+        // No truncation under the cap: result returned verbatim.
+        assert_eq!(preview_result("short"), "short");
+    }
 
     #[test]
     fn kind_for_tool_maps_known_tool_names_to_acp_enums() {

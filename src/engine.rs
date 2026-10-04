@@ -247,6 +247,12 @@ pub struct AppState {
     /// emit helpers (`acp::notify_*`) branch on it so v1 Clients see
     /// v1 notifications and v2 Clients see v2.
     pub protocol_version: crate::protocol::ProtocolVersion,
+    /// Disk-backed session persistence. `None` when persistence is
+    /// disabled (`ACP_PERSISTENCE=off`): capabilities are not
+    /// advertised and `session/load` / `session/resume` keep the
+    /// `no_persistence` rejection. Shared via `Arc` so `AppState` stays
+    /// cheaply cloneable.
+    pub store: Option<Arc<crate::session_store::SessionStore>>,
 }
 
 impl Clone for AppState {
@@ -255,12 +261,21 @@ impl Clone for AppState {
             sessions: Arc::clone(&self.sessions),
             config: self.config.clone(),
             protocol_version: self.protocol_version,
+            store: self.store.clone(),
         }
     }
 }
 
 impl AppState {
     pub fn new(config: LlmConfig) -> Arc<Self> {
+        Self::with_store(config, None)
+    }
+
+    /// Real constructor. `store` is `Some` when persistence is enabled.
+    pub fn with_store(
+        config: LlmConfig,
+        store: Option<Arc<crate::session_store::SessionStore>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             config,
@@ -269,6 +284,7 @@ impl AppState {
             // `initialize`. We pick V1 here so unit tests that build an
             // AppState directly get v1 wire format without ceremony.
             protocol_version: crate::protocol::ProtocolVersion::V1,
+            store,
         })
     }
 
@@ -341,7 +357,11 @@ impl AppState {
 /// - `ProtocolVersion::V2` → unified `capabilities` + `info` shape, with
 ///   `promptCapabilities.image` expressed as `{}` (capability marker)
 ///   rather than `true`
-pub fn initialize(config: &LlmConfig, protocol_version: crate::protocol::ProtocolVersion) -> Value {
+pub fn initialize(
+    config: &LlmConfig,
+    protocol_version: crate::protocol::ProtocolVersion,
+    persistence_enabled: bool,
+) -> Value {
     info!(
         model = %config.model,
         base_url = %config.base_url,
@@ -370,8 +390,10 @@ pub fn initialize(config: &LlmConfig, protocol_version: crate::protocol::Protoco
                 "version": env!("CARGO_PKG_VERSION")
             },
             "capabilities": {
+                "loadSession": true,
                 "session": {
-                    "prompt": prompt_capabilities_v2
+                    "prompt": prompt_capabilities_v2,
+                    "resume": {},
                 }
             },
             "authMethods": []
@@ -391,15 +413,26 @@ pub fn initialize(config: &LlmConfig, protocol_version: crate::protocol::Protoco
                     "embeddedContext": false
                 })
             };
+            let mut agent_capabilities = json!({
+                "loadSession": persistence_enabled,
+                "promptCapabilities": prompt_capabilities_v1
+            });
+            // Spec: omitted capabilities are treated as UNSUPPORTED — with
+            // persistence off, `loadSession` must be absent so Clients never
+            // attempt `session/load` (issue #17).
+            if !persistence_enabled {
+                agent_capabilities
+                    .as_object_mut()
+                    .expect("object")
+                    .remove("loadSession");
+            }
             json!({
                 "protocolVersion": 1,
                 "agentInfo": {
                     "name": format!("acp-bridge ({})", config.model),
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "agentCapabilities": {
-                    "promptCapabilities": prompt_capabilities_v1
-                },
+                "agentCapabilities": agent_capabilities,
                 "authMethods": []
             })
         }
@@ -446,6 +479,11 @@ pub fn session_new(
         protocol_version,
     );
     state.sessions_write().insert(session_id.clone(), session);
+
+    // Persist the (empty) session immediately: a Client that restores
+    // after a restart must be able to load a session even when the
+    // restart happened before the first prompt (issue #17).
+    persist_session_snapshot(state, &session_id);
 
     info!(session_id = %session_id, max_history = state.config.max_history_turns, "New session");
 
@@ -710,6 +748,7 @@ pub async fn session_prompt(
                 // additional aggregate chunk here (the client would see
                 // the answer twice).
             }
+            persist_session_snapshot(state, session_id);
             break;
         }
 
@@ -791,6 +830,12 @@ pub async fn session_prompt(
                         .push(backend.format_tool_result(tool_call_id, &result));
                 }
             }
+
+            // Persist after each completed tool round (issue #17): a
+            // crash or SIGTERM mid-turn keeps every completed round; only
+            // the in-flight round is lost. Off the notification path —
+            // the client-visible stream never waits for disk.
+            persist_session_snapshot(state, session_id);
         }
 
         round += 1;
@@ -879,6 +924,14 @@ pub fn estimate_tokens(messages: &[Value]) -> u64 {
 pub fn session_end(state: &AppState, session_id: &str) -> Result<(), AcpError> {
     let removed = state.sessions_write().remove(session_id).is_some();
     if removed {
+        // The Client explicitly ended the session — drop the persisted
+        // snapshot too, otherwise a later session/load would resurrect
+        // it (issue #17).
+        if let Some(store) = &state.store {
+            if let Err(e) = store.delete(session_id) {
+                warn!(error = %e, session_id, "Failed to delete persisted session");
+            }
+        }
         info!(session_id = %session_id, "Session ended");
         Ok(())
     } else {
@@ -886,6 +939,190 @@ pub fn session_end(state: &AppState, session_id: &str) -> Result<(), AcpError> {
             session_id: session_id.into(),
         })
     }
+}
+
+/// Snapshot a live session into the persistence store (issue #17).
+///
+/// Synchronous by design: a WAL upsert of one small row is sub-
+/// millisecond, and keeping saves inline between rounds guarantees
+/// ordering — concurrent saves could persist a stale snapshot over a
+/// newer one. No-op when persistence is disabled or the session is
+/// already gone.
+pub fn persist_session_snapshot(state: &AppState, session_id: &str) {
+    let Some(store) = &state.store else {
+        return;
+    };
+    let record = {
+        let sessions = state.sessions_read();
+        let Some(session) = sessions.get(session_id) else {
+            return;
+        };
+        crate::session_store::SessionRecord {
+            session_id: session_id.to_string(),
+            cwd: session.working_dir.display().to_string(),
+            protocol_version: session.protocol_version.as_u16(),
+            title: None,
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            messages: session.messages.clone(),
+        }
+    };
+    if let Err(e) = store.save(&record) {
+        warn!(error = %e, session_id, "Failed to persist session snapshot");
+    }
+}
+
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// One conversation-history entry mapped back to a Client-visible
+/// replay notification (issue #17). Derived from the persisted
+/// OpenAI-style history at `session/load` time — nothing extra is
+/// stored for this.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplayEvent {
+    UserText(String),
+    AssistantText(String),
+    ToolCall {
+        id: String,
+        name: String,
+        args: Value,
+    },
+    ToolResult {
+        id: String,
+        result: String,
+    },
+}
+
+/// Map the persisted session history to replay events, in order. The
+/// system prompt is skipped (it is re-created, not replayed); thinking
+/// text is display-only and never persisted (#5), so it never replays.
+pub fn replay_updates(messages: &[Value]) -> Vec<ReplayEvent> {
+    let mut events = Vec::new();
+    for m in messages {
+        match m.get("role").and_then(|v| v.as_str()) {
+            Some("user") => {
+                let text = match m.get("content") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Array(parts)) => extract_text_parts(parts),
+                    _ => continue,
+                };
+                if !text.is_empty() {
+                    events.push(ReplayEvent::UserText(text));
+                }
+            }
+            Some("assistant") => {
+                if let Some(text) = m.get("content").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        events.push(ReplayEvent::AssistantText(text.to_string()));
+                    }
+                }
+                if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in calls {
+                        let id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        // OpenAI-compatible carries arguments as a JSON
+                        // string; Ollama native as an object. Normalize to
+                        // a Value for the rawInput field.
+                        let args: Value = match tc.get("function").and_then(|f| f.get("arguments"))
+                        {
+                            Some(Value::String(s)) => {
+                                serde_json::from_str(s).unwrap_or(Value::Null)
+                            }
+                            Some(v @ Value::Object(_)) => v.clone(),
+                            _ => Value::Null,
+                        };
+                        events.push(ReplayEvent::ToolCall { id, name, args });
+                    }
+                }
+            }
+            Some("tool") => {
+                let id = m
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let result = m
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                events.push(ReplayEvent::ToolResult { id, result });
+            }
+            _ => {} // system and anything unrecognized
+        }
+    }
+    events
+}
+
+/// Restore a persisted session into the live session map and return the
+/// replay timeline. `replay = false` is `session/resume` (spec: restore
+/// context, respond without streaming history); `replay = true` is
+/// `session/load`.
+///
+/// The request cwd must match the persisted cwd — the spec makes cwd the
+/// base for relative-path resolution, so silently re-anchoring a session
+/// to a different tree would break tool sandboxing.
+pub fn session_restore(
+    state: &AppState,
+    replay: bool,
+    session_id: &str,
+    request_cwd: &str,
+    store: &crate::session_store::SessionStore,
+) -> Result<Vec<ReplayEvent>, AcpError> {
+    let record = store
+        .load(session_id)
+        .map_err(|e| AcpError::LlmError {
+            reason: format!("persistence store error: {e}"),
+        })?
+        .ok_or_else(|| AcpError::UnknownSession {
+            session_id: session_id.to_string(),
+        })?;
+
+    if record.cwd != request_cwd {
+        return Err(AcpError::LlmError {
+            reason: format!(
+                "cwd mismatch for session {}: persisted '{}', requested '{}'",
+                session_id, record.cwd, request_cwd
+            ),
+        });
+    }
+
+    let session = Session {
+        messages: record.messages.clone(),
+        last_active: std::time::Instant::now(),
+        working_dir: PathBuf::from(&record.cwd),
+        protocol_version: state.protocol_version,
+    };
+    state
+        .sessions_write()
+        .insert(session_id.to_string(), session);
+
+    info!(
+        session_id = %session_id,
+        replay = replay,
+        messages = record.messages.len(),
+        "Session restored from persistence"
+    );
+
+    Ok(if replay {
+        replay_updates(&record.messages)
+    } else {
+        Vec::new()
+    })
 }
 
 /// Handle `session/list` (v2 baseline) — returns a list of currently
@@ -1159,7 +1396,7 @@ mod tests {
 
     #[test]
     fn initialize_does_not_advertise_image_by_default() {
-        let caps = initialize(&cfg_with_image(false), ProtocolVersion::V1);
+        let caps = initialize(&cfg_with_image(false), ProtocolVersion::V1, false);
         assert_eq!(caps["protocolVersion"], 1);
         assert_eq!(
             caps["agentCapabilities"]["promptCapabilities"]["image"], false,
@@ -1178,7 +1415,7 @@ mod tests {
 
     #[test]
     fn initialize_advertises_image_when_opted_in() {
-        let caps = initialize(&cfg_with_image(true), ProtocolVersion::V1);
+        let caps = initialize(&cfg_with_image(true), ProtocolVersion::V1, false);
         assert_eq!(
             caps["agentCapabilities"]["promptCapabilities"]["image"], true,
             "image must be true when prompt_supports_image is set"
@@ -1187,7 +1424,7 @@ mod tests {
 
     #[test]
     fn initialize_v2_uses_unified_capabilities_and_info_shape() {
-        let caps = initialize(&cfg_with_image(true), ProtocolVersion::V2);
+        let caps = initialize(&cfg_with_image(true), ProtocolVersion::V2, false);
         assert_eq!(caps["protocolVersion"], 2);
         // v2 collapses agentCapabilities / clientCapabilities into a single
         // `capabilities`, and `agentInfo` / `clientInfo` into `info`.
@@ -1216,7 +1453,7 @@ mod tests {
 
     #[test]
     fn initialize_v2_omits_image_when_disabled() {
-        let caps = initialize(&cfg_with_image(false), ProtocolVersion::V2);
+        let caps = initialize(&cfg_with_image(false), ProtocolVersion::V2, false);
         let prompt_caps = &caps["capabilities"]["session"]["prompt"];
         assert!(
             prompt_caps.get("image").is_none(),
@@ -1232,7 +1469,7 @@ mod tests {
         // should produce the v1 wire shape — Clients that omit
         // protocolVersion still get a working session on the most widely
         // deployed wire shape.
-        let caps = initialize(&cfg_with_image(false), ProtocolVersion::default());
+        let caps = initialize(&cfg_with_image(false), ProtocolVersion::default(), false);
         assert_eq!(caps["protocolVersion"], 1);
     }
 
