@@ -2093,3 +2093,80 @@ async fn test_thought_chunk_carries_content_block() {
 
     h.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Issue #18: SIGTERM takes the same graceful-shutdown path as SIGINT
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sigterm_exits_gracefully() {
+    // The agent is spawned by a supervisor in real deployments; a binary
+    // update (`pkill acp-bridge`) sends SIGTERM. The process must take
+    // the same graceful path as Ctrl-C and exit 0 — previously SIGTERM
+    // killed it abruptly with a non-zero status.
+    //
+    // The signal handler registers when the main select loop first polls;
+    // signaling before that hits the default disposition. So this test
+    // waits for the startup banner on stderr (deterministic readiness)
+    // plus a small slack for the loop to start, instead of a blind sleep.
+    let port = free_port();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_llm_router()).await.unwrap();
+    });
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_acp-bridge"));
+    let stderr_file = std::fs::File::create(std::env::temp_dir().join("acp_sigterm_test.log"))
+        .expect("create stderr log");
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr_file))
+        .env("LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
+        .env("LLM_MODEL", "test-model")
+        .env("LLM_API_KEY", "test-key")
+        .env("RUST_LOG", "acp_bridge=debug");
+    let mut child = cmd.spawn().expect("Failed to spawn acp-bridge");
+
+    // Readiness: wait for the startup banner in the captured stderr —
+    // the handler registers when the main select loop is first polled,
+    // which follows the banner closely.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let content = std::fs::read_to_string(std::env::temp_dir().join("acp_sigterm_test.log"))
+            .unwrap_or_default();
+        if content.contains("Starting acp-bridge") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child never started; log: {content}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let pid = child.id() as libc::c_int;
+    // SAFETY: sending SIGTERM to our own child process.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match child.try_wait().expect("try_wait failed") {
+                Some(status) => break status,
+                None => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("agent did not exit within 10s of SIGTERM");
+
+    assert!(
+        status.success(),
+        "SIGTERM must produce exit code 0 (graceful), got: {status}; stderr tail: {}",
+        std::fs::read_to_string(std::env::temp_dir().join("acp_sigterm_test.log"))
+            .unwrap_or_default()
+    );
+}
