@@ -529,6 +529,91 @@ async fn test_session_end_unknown_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_thinking_text_surfaces_as_agent_thought_chunk() {
+    // Backend returns reasoning_content alongside the final answer
+    // (GLM/DeepSeek-style non-streaming shape). The turn must surface the
+    // reasoning as an agent_thought_chunk carrying text, ordered before the
+    // final message chunk, and the reasoning must NOT leak into the
+    // session history (it is display-only).
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                axum::Json(json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "reasoning_content": "The user greeted me; I should greet back.",
+                            "content": "Hello!"
+                        }
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                }))
+            }),
+        )
+        .route("/api/tags", get(mock_ollama_tags));
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hi"}]}
+    }));
+
+    let (notifications, response) = h.read_until_response(2);
+
+    // Find thought chunks carrying non-empty text.
+    let thoughts: Vec<&str> = notifications
+        .iter()
+        .filter_map(|m| {
+            let u = &m["params"]["update"];
+            (u["sessionUpdate"] == "agent_thought_chunk")
+                .then(|| u["content"]["text"].as_str())
+                .flatten()
+                .filter(|t| !t.is_empty())
+        })
+        .collect();
+    assert_eq!(
+        thoughts,
+        vec!["The user greeted me; I should greet back."],
+        "Expected one thought chunk with the model's reasoning text"
+    );
+
+    // The thought must be ordered before the final answer chunk.
+    let thought_idx = notifications.iter().position(|m| {
+        m["params"]["update"]["sessionUpdate"] == "agent_thought_chunk"
+            && !m["params"]["update"]["content"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
+    });
+    let answer_idx = notifications
+        .iter()
+        .position(|m| m["params"]["update"]["sessionUpdate"] == "agent_message_chunk");
+    assert!(
+        thought_idx.is_some() && answer_idx.is_some() && thought_idx < answer_idx,
+        "Expected the thought chunk before the answer chunk"
+    );
+
+    // The turn still completes normally with the final answer as text.
+    assert_eq!(response["result"]["status"], "completed");
+    assert_eq!(response["result"]["text"], "Hello!");
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_session_end_missing_session_id() {
     let port = free_port();
     let mut h = TestHarness::start(port).await;

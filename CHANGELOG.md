@@ -9,6 +9,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Model reasoning surfaced as thought chunks** — when a backend returns
+  the model's reasoning separate from the final answer, the engine now
+  emits it as `agent_thought_chunk` text (ordered before the answer /
+  tool calls of that round): `message.reasoning_content` on
+  OpenAI-compatible servers (DeepSeek/GLM style — verified live against
+  GLM-5.3-Flash) and `message.thinking` on Ollama native. The streaming
+  parser additionally recognizes `delta.reasoning_content` /
+  `delta.reasoning` as `StreamChunk::Thinking`, ready for a future
+  token-streaming path. Reasoning text is display-only: it is never
+  appended to session history and never treated as the final answer. (#5)
+
+### Changed
+
 - **Configurable tool-call round limit** — new `[llm] max_tool_rounds`
   config key and `LLM_MAX_TOOL_ROUNDS` env var (env > config file >
   default, matching the existing precedence chain). The per-turn

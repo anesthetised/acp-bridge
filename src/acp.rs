@@ -351,6 +351,21 @@ fn notify_thinking_v2(session_id: &str) {
     );
 }
 
+/// Notify an `agent_thought_chunk` carrying model reasoning text.
+///
+/// v1 and v2 share the same wire shape here (the discriminator and the
+/// content block are identical in both schemas), so there is no per-version
+/// dispatcher — clients render the text in their thought/turn UI.
+pub fn notify_thinking_text(session_id: &str, text: &str) {
+    send_session_update(
+        session_id,
+        json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": text}
+        }),
+    );
+}
+
 /// Dispatch a tool-call start notification.
 ///
 /// ACP v2 removed the `tool_call` sessionUpdate entirely. v2 Clients

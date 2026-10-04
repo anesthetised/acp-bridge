@@ -157,6 +157,43 @@ impl Backend {
         String::new()
     }
 
+    /// Extract the model's reasoning ("thinking") text from a backend
+    /// response, if the backend separates it from the final message.
+    ///
+    /// OpenAI-compatible servers in the DeepSeek/GLM style return it in
+    /// `choices[0].message.reasoning_content`; Ollama native returns it in
+    /// `message.thinking`. Returns an empty string when absent — callers
+    /// treat that as "no reasoning this round".
+    ///
+    /// This is display-only text: the engine never appends it to the
+    /// session history (upstreams reject or mis-handle reasoning blocks in
+    /// follow-up turns) and never treats it as the final answer.
+    pub fn extract_reasoning_text(&self, response: &Value) -> String {
+        // Ollama native: response.message.thinking
+        if let Some(thinking) = response
+            .get("message")
+            .and_then(|m| m.get("thinking"))
+            .and_then(|t| t.as_str())
+        {
+            if !thinking.is_empty() {
+                return thinking.to_string();
+            }
+        }
+
+        // OpenAI-compatible: response.choices[0].message.reasoning_content
+        if let Some(reasoning) = response
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("reasoning_content"))
+            .and_then(|r| r.as_str())
+        {
+            return reasoning.to_string();
+        }
+
+        String::new()
+    }
+
     /// Extract tool calls from a backend response.
     pub fn extract_tool_calls(&self, response: &Value) -> Vec<Value> {
         // Ollama native: response.message.tool_calls
@@ -410,6 +447,10 @@ impl LlmConfig {
 #[derive(Debug)]
 pub enum StreamChunk {
     Content(String),
+    /// Model reasoning delta — `delta.reasoning_content` (DeepSeek/GLM
+    /// style) or `delta.reasoning` (some OpenAI-compatible servers).
+    /// Display-only; the engine surface for this is `agent_thought_chunk`.
+    Thinking(String),
     Error(String),
     Done,
 }
@@ -838,10 +879,24 @@ async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Send
                     }
 
                     if let Ok(parsed) = serde_json::from_str::<Value>(data) {
-                        if let Some(text) = parsed
+                        let delta = parsed
                             .get("choices")
                             .and_then(|c| c.get(0))
-                            .and_then(|c| c.get("delta"))
+                            .and_then(|c| c.get("delta"));
+
+                        // Reasoning deltas first — thinking-mode models
+                        // emit them before content; some servers also send
+                        // both in one chunk.
+                        let reasoning = delta
+                            .and_then(|d| d.get("reasoning_content").or_else(|| d.get("reasoning")))
+                            .and_then(|t| t.as_str());
+                        if let Some(text) = reasoning {
+                            if !text.is_empty() {
+                                let _ = tx.send(StreamChunk::Thinking(text.to_string())).await;
+                            }
+                        }
+
+                        if let Some(text) = delta
                             .and_then(|d| d.get("content"))
                             .and_then(|t| t.as_str())
                         {
@@ -1141,6 +1196,79 @@ mod tests {
 
     // -- chat (retry + errors) ---------------------------------------------
 
+    #[test]
+    fn extract_reasoning_text_reads_openai_reasoning_content() {
+        let openai = json!({
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": "391",
+                "reasoning_content": "17*23 = 17*20 + 17*3"
+            }}]
+        });
+        assert_eq!(
+            Backend::OpenAi.extract_reasoning_text(&openai),
+            "17*23 = 17*20 + 17*3"
+        );
+        // No reasoning fields → empty string.
+        let plain = json!({"choices": [{"message": {"role": "assistant", "content": "hi"}}]});
+        assert_eq!(Backend::OpenAi.extract_reasoning_text(&plain), "");
+    }
+
+    #[test]
+    fn extract_reasoning_text_reads_ollama_thinking() {
+        let ollama = json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "thinking": "the user asked for a sum"
+            }
+        });
+        assert_eq!(
+            Backend::Ollama.extract_reasoning_text(&ollama),
+            "the user asked for a sum"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_emits_thinking_deltas() {
+        async fn sse() -> impl IntoResponse {
+            let chunks = vec![
+                format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"delta": {"reasoning_content": "pondering"}}]})
+                ),
+                format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"delta": {"content": "Answer"}}]})
+                ),
+                "data: [DONE]\n\n".to_string(),
+            ];
+            let stream = futures_lite::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+            );
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        let url = serve(Router::new().route("/v1/chat/completions", post(sse))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let mut rx = stream_chat(&cfg, &[], None).await.unwrap();
+
+        let mut thinking = String::new();
+        let mut content = String::new();
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                StreamChunk::Thinking(t) => thinking.push_str(&t),
+                StreamChunk::Content(c) => content.push_str(&c),
+                StreamChunk::Done => break,
+                StreamChunk::Error(e) => panic!("unexpected stream error: {e}"),
+            }
+        }
+        assert_eq!(thinking, "pondering");
+        assert_eq!(content, "Answer");
+    }
+
     #[tokio::test]
     async fn chat_returns_response_on_success() {
         async fn ok() -> impl IntoResponse {
@@ -1198,6 +1326,7 @@ mod tests {
         while let Some(chunk) = rx.recv().await {
             match chunk {
                 StreamChunk::Content(c) => text.push_str(&c),
+                StreamChunk::Thinking(t) => text.push_str(&t),
                 StreamChunk::Done => {
                     done = true;
                     break;
