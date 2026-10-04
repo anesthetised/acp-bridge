@@ -574,12 +574,18 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
         match notif {
             Notification::Thinking => acp::notify_thinking_for(state.protocol_version, &session_id),
             Notification::ThinkingText { text } => acp::notify_thinking_text(&session_id, &text),
-            Notification::ToolStart { id, name } => {
-                acp::notify_tool_start_for(state.protocol_version, &session_id, &id, &name)
+            Notification::ToolStart { id, name, args } => {
+                acp::notify_tool_start_for(state.protocol_version, &session_id, &id, &name, &args)
             }
-            Notification::ToolDone { id, name, status } => {
-                acp::notify_tool_done_for(state.protocol_version, &session_id, &id, &name, &status)
-            }
+            Notification::ToolDone {
+                id, status, result, ..
+            } => acp::notify_tool_done_for(
+                state.protocol_version,
+                &session_id,
+                &id,
+                &status,
+                result.as_deref(),
+            ),
             Notification::TextChunk(text) => {
                 acp::notify_text_for(state.protocol_version, &session_id, &text)
             }

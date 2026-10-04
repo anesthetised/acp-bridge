@@ -782,7 +782,7 @@ async fn test_streamed_tool_call_fragments_execute() {
         u["sessionUpdate"] == "tool_call" && u["toolCallId"] == "call_frag"
             || u["sessionUpdate"] == "tool_call_update"
                 && u["toolCallId"] == "call_frag"
-                && u["title"] == "list_dir"
+                && u["name"] == "list_dir"
     });
     assert!(
         tool_start,
@@ -929,6 +929,175 @@ async fn test_streaming_unsupported_falls_back_to_non_streaming() {
         })
         .count();
     assert_eq!(answer_chunks, 1, "got {notifications:?}");
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tool_call_notifications_carry_specifics() {
+    // Issue #14: tool calls are inspectable on the wire. The initial
+    // report carries name / human title / rawInput / locations; the
+    // completion carries the result as content + rawOutput; a failing
+    // tool reports status "failed" instead of unconditional "completed".
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(move |req: Request<Body>| {
+                async move {
+                    let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+                    // Branch on the LAST tool result: none yet → the
+                    // failing call; an Error result → the retry that
+                    // succeeds; a successful result → final answer.
+                    let last_tool_result = body["messages"].as_array().and_then(|msgs| {
+                        msgs.iter()
+                            .rev()
+                            .find(|m| m["role"] == "tool")
+                            .and_then(|m| m["content"].as_str())
+                            .map(String::from)
+                    });
+                    match last_tool_result {
+                        None => axum::Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": "call_spec",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": "{\"path\": \"no/such/file.txt\"}"
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }]
+                        }))
+                        .into_response(),
+                        Some(r) if r.starts_with("Error") => axum::Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": "call_ok",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "list_dir",
+                                            "arguments": "{\"path\": \".\"}"
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }]
+                        }))
+                        .into_response(),
+                        Some(_) => axum::Json(json!({
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "done"},
+                                "finish_reason": "stop"
+                            }]
+                        }))
+                        .into_response(),
+                    }
+                }
+            }),
+        );
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"read files"}]}
+    }));
+    let (notifications, response) = h.read_until_response(2);
+
+    let updates: Vec<&Value> = notifications
+        .iter()
+        .filter_map(|m| {
+            let u = &m["params"]["update"];
+            matches!(
+                u["sessionUpdate"].as_str(),
+                Some("tool_call") | Some("tool_call_update")
+            )
+            .then_some(u)
+        })
+        .collect();
+
+    // Failing tool: status "failed", rawInput carries the model's
+    // arguments, content/rawOutput carry the error text.
+    let failed = updates
+        .iter()
+        .find(|u| u["toolCallId"] == "call_spec" && u["status"] == "failed")
+        .unwrap_or_else(|| panic!("expected failed update for call_spec; got {updates:?}"));
+    let start = updates
+        .iter()
+        .find(|u| u["toolCallId"] == "call_spec" && u["sessionUpdate"] == "tool_call")
+        .unwrap_or_else(|| panic!("expected initial report for call_spec"));
+    assert_eq!(start["name"], "read_file");
+    assert_eq!(start["title"], "Read no/such/file.txt");
+    assert_eq!(start["kind"], "read");
+    assert_eq!(start["rawInput"]["path"], "no/such/file.txt");
+    assert_eq!(start["locations"][0]["path"], "no/such/file.txt");
+    assert!(
+        failed["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("Error"),
+        "failed update must carry the error text: {failed}"
+    );
+    assert!(
+        failed["rawOutput"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("Error"),
+        "rawOutput must carry the error text: {failed}"
+    );
+
+    // Successful tool: completed status + result as content/rawOutput.
+    let completed = updates
+        .iter()
+        .find(|u| u["toolCallId"] == "call_ok" && u["status"] == "completed")
+        .unwrap_or_else(|| panic!("expected completed update for call_ok; got {updates:?}"));
+    let raw_output = completed["rawOutput"].as_str().unwrap_or_default();
+    assert!(!raw_output.is_empty(), "rawOutput must carry the result");
+    assert!(
+        !raw_output.starts_with("Error"),
+        "successful tool must not carry an error result: {raw_output}"
+    );
+    assert!(
+        completed["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            == raw_output,
+        "content block must mirror rawOutput: {completed}"
+    );
+    // Human title with the key argument; kind stays "read".
+    let start_ok = updates
+        .iter()
+        .find(|u| u["toolCallId"] == "call_ok" && u["sessionUpdate"] == "tool_call")
+        .unwrap();
+    assert_eq!(start_ok["title"], "List .");
+    assert_eq!(start_ok["kind"], "read");
+
+    // The turn still completes normally.
+    assert_eq!(response["result"]["status"], "completed");
 
     h.shutdown();
 }
@@ -1624,7 +1793,7 @@ async fn test_tool_round_limit_configurable() {
         .iter()
         .filter(|n| {
             n["params"]["update"]["sessionUpdate"] == "tool_call"
-                && n["params"]["update"]["title"] == "list_dir"
+                && n["params"]["update"]["name"] == "list_dir"
         })
         .count();
     assert_eq!(

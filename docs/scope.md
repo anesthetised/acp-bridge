@@ -41,7 +41,7 @@ spec-compliant v2 payloads.
 | `session/list` (v2 baseline) | ✅ | Returns currently active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}` |
 | Streaming `agent_message_chunk` | ✅ | Typed `content: {type: "text", text: …}`. v1 and v2 use the same discriminator |
 | `agent_thought_chunk` | ✅ | Typed `content: {type: "text", text: ""}` — emitted so Clients render the thought bubble. Backend reasoning text (`message.reasoning_content` / `message.thinking` / `delta.reasoning_content`) is surfaced as non-empty thought chunks before the final answer; display-only, never appended to session history |
-| `tool_call` (v1) / `tool_call_update` (v1 + v2) | ✅ | Carries the required `toolCallId`, `title`, `kind`, `status`. v1 Clients see `tool_call`; v2 Clients see only `tool_call_update` with `status: "in_progress"` |
+| `tool_call` (v1) / `tool_call_update` (v1 + v2) | ✅ | Carries `toolCallId`, `name`, human-readable `title`, `kind`, `status`, plus optional specifics: `rawInput` (model's arguments), `locations` (path-carrying tools), and on completion `rawOutput` + text `content` (preview-capped). Real `failed` status when the tool errored. v1 Clients see `tool_call`; v2 Clients see only `tool_call_update` with `status: "in_progress"` |
 | `plan` (v1) / `plan_update` (v2) | ✅ | `plan_update` carries `plan: {type: "items", planId, entries[]}` so v2 Clients can track multiple plans |
 | `available_commands_update` (v1 + v2) | ✅ | Slash-command menu: `/read`, `/ls`, `/search`, `/edit`, `/shell` |
 | `session_info_update` (v1 + v2) | ✅ | Title defaults to cwd basename, updated to first line of user prompt after each turn |

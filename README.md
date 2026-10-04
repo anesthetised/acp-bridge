@@ -383,9 +383,9 @@ the matching wire shape from the same code base.
 |--------------|---------------|--------|
 | Streaming text chunk | `agent_message_chunk` (v1 + v2) | Emitted per text delta. The engine's tool loop runs on streamed rounds, so the answer streams incrementally instead of arriving as one blob at turn end |
 | Streaming thought chunk | `agent_thought_chunk` (v1 + v2) | Model reasoning streams delta-by-delta while the model thinks (`delta.reasoning_content` / `delta.reasoning` on OpenAI-compatible servers, `message.thinking` on Ollama native); non-streaming backends surface the round's reasoning as one chunk before the answer. Display-only, never fed back into the conversation history |
-| Tool call start (v1) | `tool_call` | Carries `toolCallId`, `title`, `kind`, `status: "in_progress"` |
+| Tool call start (v1) | `tool_call` | Carries `toolCallId`, `name`, human-readable `title` (key argument baked in), `kind`, `status: "in_progress"`, plus `rawInput` (the model's arguments) and `locations` for path-carrying tools |
 | Tool call start (v2) | `tool_call_update` (upsert) | Same fields. v2 removed the legacy `tool_call` discriminator. |
-| Tool call update | `tool_call_update` (v1 + v2) | Carries the new `status` (`pending` / `in_progress` / `completed` / `failed`) |
+| Tool call update | `tool_call_update` (v1 + v2) | Carries the new `status` (`pending` / `in_progress` / `completed` / `failed`) — real `failed` when the tool errored — plus the result as `rawOutput` and a text `content` block (preview-capped; the model received the full result) |
 | Plan (v1) | `plan` | `entries: PlanEntry[]`. Helper is in place; the LLM does not currently auto-emit plans. |
 | Plan (v2) | `plan_update` | Wrapped in `plan: { type: "items", planId, entries[] }` so Clients can track multiple plans independently. |
 | Session info | `session_info_update` | v1 + v2. Carries the session `title`. acp-bridge emits it after `session/new` (defaults to cwd basename) and after each `session/prompt` (first line of user prompt). |

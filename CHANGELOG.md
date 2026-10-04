@@ -9,6 +9,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Tool calls are inspectable on the wire** — `tool_call` /
+  `tool_call_update` notifications now carry the spec-optional specifics
+  Clients need to render what a tool is doing: `name` (programmatic), a
+  human-readable `title` with the key argument ("Read src/main.rs",
+  "Bash: git status" — previously the bare tool name), `rawInput` (the
+  model's arguments), `locations` for path-carrying tools, and on
+  completion the result as `rawOutput` plus a text `content` block
+  (preview-capped at 8 KB — the model receives the full result).
+  Detected tool failures now report `status: "failed"` instead of an
+  unconditional `completed`. All new fields are additive; Clients
+  ignoring them see the old behavior. (#14)
+
 - **The engine's tool loop now runs on streamed rounds** — each round
   consumes the backend's streamed response, so model reasoning arrives as
   incremental `agent_thought_chunk`s while the model thinks and the final

@@ -1601,6 +1601,12 @@ mod tests {
         // free to treat a plain close as a complete body.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        // Gate against scheduling races: headers are written immediately
+        // at accept (setup always completes), and the data chunk lands
+        // only after the client's parser is running. Dropping without the
+        // [DONE] sentinel is the mid-stream failure under test — since
+        // issue #11, EOF without the sentinel is classified as a failure
+        // (server crash / proxy timeout), not a normal end.
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
@@ -1610,11 +1616,10 @@ mod tests {
             );
             use tokio::io::AsyncWriteExt;
             let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = sock.write_all(body.as_bytes()).await;
             let _ = sock.flush().await;
-            // Close without the [DONE] sentinel — since issue #11, EOF
-            // without the sentinel is classified as a mid-stream failure
-            // (server crash / proxy timeout), not a normal end.
             drop(sock);
         });
 

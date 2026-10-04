@@ -212,12 +212,20 @@ pub enum Notification {
         /// the synthetic outer `llm_chat` event we mint a stable id derived
         /// from the session/round so clients can render it.
         id: String,
+        /// Programmatic tool name (`read_file`, `bash`, …).
         name: String,
+        /// Parsed arguments the model sent — surfaced as `rawInput` on the
+        /// wire and baked into the human-readable title (issue #14).
+        args: Value,
     },
     ToolDone {
         id: String,
         name: String,
         status: String,
+        /// Tool result text — surfaced as `rawOutput` + a text `content`
+        /// block on the completion update (issue #14). `None` for
+        /// pseudo-tools with nothing to show.
+        result: Option<String>,
     },
     TextChunk(String),
 }
@@ -577,6 +585,7 @@ pub async fn session_prompt(
     notify(Notification::ToolStart {
         id: format!("llm_chat:{session_id}"),
         name: "llm_chat".into(),
+        args: Value::Null,
     });
 
     let mut had_error = false;
@@ -753,12 +762,23 @@ pub async fn session_prompt(
             notify(Notification::ToolStart {
                 id: tool_call_id.to_string(),
                 name: name.into(),
+                args: args.clone(),
             });
             let result = tools::execute_tool(&working_dir, name, &args);
+            // Tool failures are signaled by the "Error" prefix of the
+            // result text (see tools.rs) — surface them as a real
+            // `failed` status instead of unconditional `completed`
+            // (issue #14).
+            let status = if result.starts_with("Error") {
+                "failed"
+            } else {
+                "completed"
+            };
             notify(Notification::ToolDone {
                 id: tool_call_id.to_string(),
                 name: name.into(),
-                status: "completed".into(),
+                status: status.into(),
+                result: Some(result.clone()),
             });
 
             debug!(tool = name, result_len = result.len(), "Tool executed");
@@ -800,6 +820,7 @@ pub async fn session_prompt(
         id: format!("llm_chat:{session_id}"),
         name: "llm_chat".into(),
         status: status.into(),
+        result: None,
     });
 
     // Estimate the current context utilization for `usage_update`. Local
@@ -1220,11 +1241,13 @@ mod tests {
         let n = Notification::ToolStart {
             id: "tc_42".into(),
             name: "read_file".into(),
+            args: json!({"path": "src/main.rs"}),
         };
         match n {
-            Notification::ToolStart { id, name } => {
+            Notification::ToolStart { id, name, args } => {
                 assert_eq!(id, "tc_42");
                 assert_eq!(name, "read_file");
+                assert_eq!(args["path"], "src/main.rs");
             }
             _ => panic!("expected ToolStart"),
         }
@@ -1236,12 +1259,19 @@ mod tests {
             id: "tc_42".into(),
             name: "read_file".into(),
             status: "completed".into(),
+            result: Some("file contents".into()),
         };
         match n {
-            Notification::ToolDone { id, name, status } => {
+            Notification::ToolDone {
+                id,
+                name,
+                status,
+                result,
+            } => {
                 assert_eq!(id, "tc_42");
                 assert_eq!(name, "read_file");
                 assert_eq!(status, "completed");
+                assert_eq!(result.as_deref(), Some("file contents"));
             }
             _ => panic!("expected ToolDone"),
         }

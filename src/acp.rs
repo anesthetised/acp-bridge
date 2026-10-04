@@ -100,6 +100,48 @@ pub fn notify_thinking(session_id: &str) {
 /// `tools::tool_definitions` set shipped in this crate; unknown names fall
 /// back to `"other"` so clients still render the tool call instead of
 /// dropping it on the floor.
+/// Cap on the tool result text embedded in `tool_call_update`
+/// notifications. The full result still goes to the model via the session
+/// history; this only bounds the wire notification (a `read_file` result
+/// can approach `MAX_FILE_SIZE`, which would flood the client channel).
+const TOOL_RESULT_MAX: usize = 8192;
+
+/// Human-readable title for a tool call, per the ACP spec ("a
+/// human-readable title describing what the tool is doing"). The key
+/// argument is baked in so Clients show *what* the tool is doing without
+/// expanding `rawInput` — "Read src/main.rs", not "read_file".
+fn human_tool_title(name: &str, args: &Value) -> String {
+    let arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    match name {
+        "read_file" => format!("Read {}", arg("path")),
+        "list_dir" => format!("List {}", arg("path")),
+        "write_file" => format!("Write {}", arg("path")),
+        "edit" => format!("Edit {}", arg("path")),
+        "search_code" => format!("Search \"{}\"", arg("pattern")),
+        "bash" => {
+            let cmd = arg("command");
+            let mut shortened: String = cmd.chars().take(60).collect();
+            if cmd.chars().count() > 60 {
+                shortened.push('…');
+            }
+            format!("Bash: {shortened}")
+        }
+        "web_fetch" => format!("Fetch {}", arg("url")),
+        "git_status" => "Git status".to_string(),
+        "git_diff" => "Git diff".to_string(),
+        "git_log" => "Git log".to_string(),
+        "git_commit" => "Git commit".to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// `locations` for tools whose arguments identify a file — path as given
+/// (relative to the session cwd, which Clients receive via the session).
+fn tool_locations(args: &Value) -> Option<Vec<Value>> {
+    let path = args.get("path").and_then(|v| v.as_str())?;
+    Some(vec![json!({"path": path})])
+}
+
 pub fn kind_for_tool(name: &str) -> &'static str {
     match name {
         // File inspection
@@ -127,17 +169,26 @@ pub fn kind_for_tool(name: &str) -> &'static str {
 /// `tool_call_id` is required by ACP v1: clients use it to pair subsequent
 /// `tool_call_update` notifications with the originating tool call. Without
 /// it the client cannot render a coherent per-tool timeline.
-pub fn notify_tool_start(session_id: &str, tool_call_id: &str, title: &str) {
-    send_session_update(
-        session_id,
-        json!({
-            "sessionUpdate": "tool_call",
-            "toolCallId": tool_call_id,
-            "title": title,
-            "kind": kind_for_tool(title),
-            "status": "in_progress"
-        }),
-    );
+///
+/// Carries the spec-optional specifics: `name` (programmatic), a
+/// human-readable `title` with the key argument baked in, `rawInput` (the
+/// arguments the model sent) and `locations` for path-carrying tools.
+pub fn notify_tool_start(session_id: &str, tool_call_id: &str, name: &str, args: &Value) {
+    let mut body = json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": tool_call_id,
+        "name": name,
+        "title": human_tool_title(name, args),
+        "kind": kind_for_tool(name),
+        "status": "in_progress"
+    });
+    if !args.is_null() {
+        body["rawInput"] = args.clone();
+    }
+    if let Some(locations) = tool_locations(args) {
+        body["locations"] = json!(locations);
+    }
+    send_session_update(session_id, body);
 }
 
 /// Notify a tool_call_update (status change or content append).
@@ -145,16 +196,34 @@ pub fn notify_tool_start(session_id: &str, tool_call_id: &str, title: &str) {
 /// `tool_call_id` is required. `status` is one of `pending | in_progress |
 /// completed | failed`. Spec-compliant clients ignore notifications whose
 /// toolCallId they have not seen.
-pub fn notify_tool_done(session_id: &str, tool_call_id: &str, title: &str, status: &str) {
-    send_session_update(
-        session_id,
-        json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": tool_call_id,
-            "title": title,
-            "status": status
-        }),
-    );
+pub fn notify_tool_done(session_id: &str, tool_call_id: &str, status: &str, result: Option<&str>) {
+    let mut body = json!({
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": tool_call_id,
+        "status": status
+    });
+    if let Some(result) = result {
+        if !result.is_empty() {
+            // Preview cap: the full result already reached the model via
+            // the session history; this bounds only the wire notification.
+            let text = if result.len() > TOOL_RESULT_MAX {
+                let mut cut = result[..TOOL_RESULT_MAX].to_string();
+                cut.push_str(&format!(
+                    "\n\n[truncated for display; {} more characters — the model received the full result]",
+                    result.len() - TOOL_RESULT_MAX
+                ));
+                cut
+            } else {
+                result.to_string()
+            };
+            body["content"] = json!([{
+                "type": "content",
+                "content": {"type": "text", "text": text}
+            }]);
+            body["rawOutput"] = json!(text);
+        }
+    }
+    send_session_update(session_id, body);
 }
 
 /// One entry in an `agent_plan` notification.
@@ -376,40 +445,48 @@ pub fn notify_tool_start_for(
     version: ProtocolVersion,
     session_id: &str,
     tool_call_id: &str,
-    title: &str,
+    name: &str,
+    args: &Value,
 ) {
     match version {
-        ProtocolVersion::V2 => notify_tool_start_v2(session_id, tool_call_id, title),
-        _ => notify_tool_start(session_id, tool_call_id, title),
+        ProtocolVersion::V2 => notify_tool_start_v2(session_id, tool_call_id, name, args),
+        _ => notify_tool_start(session_id, tool_call_id, name, args),
     }
 }
 
-fn notify_tool_start_v2(session_id: &str, tool_call_id: &str, title: &str) {
-    send_session_update(
-        session_id,
-        json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": tool_call_id,
-            "title": title,
-            "kind": kind_for_tool(title),
-            "status": "in_progress"
-        }),
-    );
+/// v2 has no legacy `tool_call` discriminator; the upsert carries the
+/// same optional specifics as v1's initial report.
+fn notify_tool_start_v2(session_id: &str, tool_call_id: &str, name: &str, args: &Value) {
+    let mut body = json!({
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": tool_call_id,
+        "name": name,
+        "title": human_tool_title(name, args),
+        "kind": kind_for_tool(name),
+        "status": "in_progress"
+    });
+    if !args.is_null() {
+        body["rawInput"] = args.clone();
+    }
+    if let Some(locations) = tool_locations(args) {
+        body["locations"] = json!(locations);
+    }
+    send_session_update(session_id, body);
 }
 
-/// Dispatch a tool-call update (status change). The v1 and v2 shapes
-/// are both `tool_call_update` and same schema, so this dispatcher just
-/// routes.
+/// Dispatch a tool-call update (status change or result delivery). The
+/// v1 and v2 shapes are both `tool_call_update` and same schema, so this
+/// dispatcher just routes.
 pub fn notify_tool_done_for(
     version: ProtocolVersion,
     session_id: &str,
     tool_call_id: &str,
-    title: &str,
     status: &str,
+    result: Option<&str>,
 ) {
     match version {
-        ProtocolVersion::V2 => notify_tool_done(session_id, tool_call_id, title, status),
-        _ => notify_tool_done(session_id, tool_call_id, title, status),
+        ProtocolVersion::V2 => notify_tool_done(session_id, tool_call_id, status, result),
+        _ => notify_tool_done(session_id, tool_call_id, status, result),
     }
 }
 

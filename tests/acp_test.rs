@@ -73,16 +73,18 @@ fn notification_text_content_format() {
 
 #[test]
 fn tool_call_notification_format() {
-    let title = "llm_chat";
+    // Issue #14: tool calls carry a programmatic `name`, a human-readable
+    // `title`, and the model's arguments as `rawInput`.
+    let name = "llm_chat";
     let params = serde_json::json!({
         "sessionId": "abc",
-        "update": {"sessionUpdate": "tool_call", "title": title}
+        "update": {"sessionUpdate": "tool_call", "name": name, "title": "Turn"}
     });
-    assert_eq!(params["update"]["title"], "llm_chat");
+    assert_eq!(params["update"]["name"], "llm_chat");
 
     let done_params = serde_json::json!({
         "sessionId": "abc",
-        "update": {"sessionUpdate": "tool_call_update", "title": title, "status": "completed"}
+        "update": {"sessionUpdate": "tool_call_update", "status": "completed"}
     });
     assert_eq!(done_params["update"]["status"], "completed");
 }
