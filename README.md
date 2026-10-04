@@ -372,8 +372,8 @@ the matching wire shape from the same code base.
 | `session/cancel` notification | Acknowledged with a log line. In-flight cancellation is on the roadmap. |
 | `session/end` (v1) / `session/close` (v2 baseline) | Session cleanup. Both methods share the same implementation. |
 | `session/list` (v2 baseline) | Returns active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}`. |
-| `session/load` | Graceful `-32001 no_persistence` rejection. acp-bridge has no persistence layer. |
-| `session/resume` | Same. |
+| `session/load` | ✅ Restores a persisted session and replays the full timeline (user → tool_call/tool_call_update → agent) before responding. SQLite-backed, saved per tool round |
+| `session/resume` | ✅ Restores without replay. Both advertise via `loadSession` / `sessionCapabilities.resume`; disable with `ACP_PERSISTENCE=off` |
 | `session/delete` (v2 optional) | Graceful `-32601 not_implemented` rejection. Use `session/close` instead. |
 | `session/set_mode` | Graceful `-32602 no_modes` rejection. `session/new` does not return a `modes` array. |
 

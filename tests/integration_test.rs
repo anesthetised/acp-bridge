@@ -2103,6 +2103,7 @@ async fn test_thought_chunk_carries_content_block() {
 // Issue #18: SIGTERM takes the same graceful-shutdown path as SIGINT
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_sigterm_exits_gracefully() {
     // The agent is spawned by a supervisor in real deployments; a binary

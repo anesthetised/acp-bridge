@@ -25,6 +25,25 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Session persistence with `session/load` / `session/resume`** —
+  sessions now survive agent restarts (binary updates, crashes,
+  supervisor respawns). Storage is SQLite via `rusqlite` (bundled — the
+  database compiles into the static binary, +~1 MB), one row per
+  session with the conversation history as a JSON payload; WAL mode and
+  per-**tool-round** saves mean a mid-turn crash keeps every completed
+  round, losing only the round in flight. `session/load` restores the
+  session and replays the full timeline as `session/update`
+  notifications (user chunks, `tool_call` + `tool_call_update` pairs
+  with results, agent chunks) before responding, per spec;
+  `session/resume` restores without replay. `loadSession` and
+  `sessionCapabilities.resume` are advertised when persistence is on.
+  Knobs: `ACP_SESSION_DB` (DB path), `ACP_SESSION_RETENTION` (keep last
+  N sessions at startup, default 100), `ACP_PERSISTENCE=off` (disable —
+  capabilities omitted, methods return the historical
+  `-32001 no_persistence`). The request cwd must match the persisted
+  session cwd — re-anchoring silently would break tool sandboxing.
+  Thinking text is display-only (#5) and never persisted. (#17)
+
 - **Tool calls are inspectable on the wire** — `tool_call` /
   `tool_call_update` notifications now carry the spec-optional specifics
   Clients need to render what a tool is doing: `name` (programmatic), a
