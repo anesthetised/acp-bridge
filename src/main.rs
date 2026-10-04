@@ -474,17 +474,51 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown_signal() => {
                 info!("Received shutdown signal, exiting");
-                break;
+                // Signal-initiated shutdown must not return through the
+                // runtime drop: tokio's stdin reader is a blocking-pool
+                // task parked in an OS read on stdin, and BlockingPool's
+                // Drop waits for it — forever, when a Client still holds
+                // the pipe open. Exit the process explicitly instead;
+                // the OS closes the read end (issue #18).
+                let session_count = state.cleanup();
+                if session_count > 0 {
+                    info!(sessions = session_count, "Cleaned up sessions on exit");
+                }
+                std::process::exit(0);
             }
         }
     }
 
-    // Cleanup
+    // Cleanup — stdin-close path: the blocking stdin read has already
+    // returned, so the runtime drops cleanly here.
     let session_count = state.cleanup();
     if session_count > 0 {
         info!(sessions = session_count, "Cleaned up sessions on exit");
+    }
+}
+
+/// Completes on SIGINT (Ctrl-C) or SIGTERM — the two termination signals
+/// supervisors and update tooling actually send. Previously only SIGINT
+/// was handled; SIGTERM killed the process abruptly, skipping the
+/// graceful-shutdown path and exiting non-zero (issue #18).
+async fn shutdown_signal() {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    sigterm.recv().await;
+                }
+                Err(e) => {
+                    // Unix-only API; on other platforms this arm simply
+                    // never fires and Ctrl-C remains the shutdown path.
+                    debug!(error = %e, "SIGTERM handler unavailable on this platform");
+                    std::future::pending::<()>().await;
+                }
+            }
+        } => {}
     }
 }
 

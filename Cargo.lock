@@ -10,6 +10,7 @@ dependencies = [
  "bytes",
  "futures-lite",
  "hyper",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
