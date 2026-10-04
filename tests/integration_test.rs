@@ -994,8 +994,8 @@ async fn test_tool_call_notifications_carry_specifics() {
                                         "id": "call_ok",
                                         "type": "function",
                                         "function": {
-                                            "name": "list_dir",
-                                            "arguments": "{\"path\": \".\"}"
+                                            "name": "write_file",
+                                            "arguments": "{\"path\": \"persist_probe.txt\", \"content\": \"known marker\"}"
                                         }
                                     }]
                                 },
@@ -1081,7 +1081,13 @@ async fn test_tool_call_notifications_carry_specifics() {
         .find(|u| u["toolCallId"] == "call_ok" && u["status"] == "completed")
         .unwrap_or_else(|| panic!("expected completed update for call_ok; got {updates:?}"));
     let raw_output = completed["rawOutput"].as_str().unwrap_or_default();
-    assert!(!raw_output.is_empty(), "rawOutput must carry the result");
+    // write_file's result reports the absolute path — deterministic on
+    // any machine (the earlier list_dir assertion broke on empty /tmp
+    // dirs in CI).
+    assert!(
+        raw_output.contains("persist_probe.txt"),
+        "rawOutput must carry the result: {raw_output}"
+    );
     assert!(
         !raw_output.starts_with("Error"),
         "successful tool must not carry an error result: {raw_output}"
@@ -1093,13 +1099,13 @@ async fn test_tool_call_notifications_carry_specifics() {
             == raw_output,
         "content block must mirror rawOutput: {completed}"
     );
-    // Human title with the key argument; kind stays "read".
+    // Human title with the key argument; write_file maps to "edit".
     let start_ok = updates
         .iter()
         .find(|u| u["toolCallId"] == "call_ok" && u["sessionUpdate"] == "tool_call")
         .unwrap();
-    assert_eq!(start_ok["title"], "List .");
-    assert_eq!(start_ok["kind"], "read");
+    assert_eq!(start_ok["title"], "Write persist_probe.txt");
+    assert_eq!(start_ok["kind"], "edit");
 
     // The turn still completes normally.
     assert_eq!(response["result"]["status"], "completed");
