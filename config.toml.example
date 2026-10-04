@@ -28,6 +28,12 @@ timeout_secs = 300
 # Prevents memory growth in long sessions
 max_history_turns = 50
 
+# Max tool-call rounds per prompt (0 = unlimited)
+# Backstop against models that never stop requesting tools; when the
+# budget is exhausted the turn ends with ACP stopReason "max_turn_requests".
+# Strong agentic models may need more than the older default of 5.
+max_tool_rounds = 25
+
 # ---------------------------------------------------------------------------
 # Client mode — spawn an external ACP agent (used with --client flag)
 # ---------------------------------------------------------------------------

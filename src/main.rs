@@ -114,6 +114,7 @@ async fn main() {
         base_url = %config.base_url,
         backend = ?config.backend(),
         max_history_turns = config.max_history_turns,
+        max_tool_rounds = config.max_tool_rounds,
         max_sessions = config.max_sessions,
         session_idle_timeout_secs = config.session_idle_timeout_secs,
         "Starting acp-bridge"
