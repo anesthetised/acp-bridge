@@ -727,13 +727,16 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
 
     // Resolve relative path against working_dir. Note: unlike read/list,
     // write_file does NOT require the file to exist — it must be allowed
-    // to create new files. We still reject absolute paths and `..`
-    // traversal by canonicalizing the parent directory after the write
-    // would-be target.
+    // to create new files, so the read path's plain canonicalize() would
+    // fail on new paths. Instead: reject `..` up front, verify the
+    // deepest EXISTING ancestor is inside the sandbox *before touching
+    // anything* (a symlinked ancestor would otherwise carry the write
+    // outside — issue #16), refuse symlinked final components, and only
+    // then create parents and write.
     let cleaned = relative_path.trim_start_matches('/');
     let target = working_dir.join(cleaned);
 
-    // Reject obvious `..` escapes: if any path component is `..`, refuse.
+    // Reject `..` escapes: if any path component is `..`, refuse.
     for component in Path::new(cleaned).components() {
         if matches!(component, std::path::Component::ParentDir) {
             return format!(
@@ -743,6 +746,51 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
         }
     }
 
+    // Walk up to the deepest existing ancestor and canonicalize it —
+    // symlink resolution included. Nothing has been created or written
+    // yet, so a rejection here has zero side effects.
+    let canonical_wd = match working_dir.canonicalize() {
+        Ok(p) => p,
+        Err(e) => return format!("Error resolving working directory: {e}"),
+    };
+    let mut probe: &Path = &target;
+    let canonical_base = loop {
+        match probe.canonicalize() {
+            Ok(p) => break p,
+            Err(_) => match probe.parent() {
+                Some(p) => probe = p,
+                None => {
+                    return format!("Error: cannot resolve path '{}'", relative_path);
+                }
+            },
+        }
+    };
+    if !canonical_base.starts_with(&canonical_wd) {
+        warn!(
+            path = %relative_path,
+            resolved = %canonical_base.display(),
+            "write_file resolves outside sandbox, rejected"
+        );
+        return format!(
+            "Error: path '{}' resolves outside the working directory",
+            relative_path
+        );
+    }
+
+    // A symlinked final component would redirect the write past the
+    // checks above — read_file rejects the same shape (its canonicalize
+    // resolves through the link), so writes refuse it too.
+    if let Ok(meta) = std::fs::symlink_metadata(&target) {
+        if meta.file_type().is_symlink() {
+            return format!(
+                "Error: '{}' is a symlink; refusing to write through it",
+                relative_path
+            );
+        }
+    }
+
+    // Create missing parents. Every existing ancestor is a verified-
+    // inside directory, so the created directories land in the sandbox.
     if let Some(parent) = target.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             return format!("Error creating parent directory: {e}");
@@ -751,12 +799,17 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
 
     match std::fs::write(&target, content) {
         Ok(()) => {
+            // Report the absolute resolved path: when the model's mental
+            // cwd drifts, "where did the file go" must be answerable from
+            // the tool result alone, not from debug logs (issue #16).
+            let absolute = target.canonicalize().unwrap_or_else(|_| target.clone());
             debug!(
                 path = %relative_path,
+                resolved = %absolute.display(),
                 bytes = content.len(),
                 "write_file"
             );
-            format!("wrote {} bytes to {}", content.len(), relative_path)
+            format!("wrote {} bytes to {}", content.len(), absolute.display())
         }
         Err(e) => format!("Error writing file: {e}"),
     }
@@ -1171,6 +1224,66 @@ mod tests {
         let result = execute_write_file(&wd, "../escape.txt", "x");
         assert!(result.starts_with("Error"), "got: {result}");
         assert!(!wd.parent().unwrap().join("escape.txt").exists());
+
+        let _ = fs::remove_dir_all(&wd);
+    }
+
+    #[test]
+    fn write_file_rejects_symlinked_ancestor() {
+        // A symlinked directory inside the workdir pointing outside must
+        // not carry the write out of the sandbox (issue #16) — and the
+        // rejection must happen before anything is created outside.
+        let wd = tmpwd();
+        let outside = tmpwd();
+        std::os::unix::fs::symlink(&outside, wd.join("link")).unwrap();
+
+        let result = execute_write_file(&wd, "link/escape.txt", "x");
+        assert!(result.starts_with("Error"), "got: {result}");
+        assert!(
+            !outside.join("escape.txt").exists(),
+            "no file may be created outside the sandbox"
+        );
+
+        let _ = fs::remove_dir_all(&wd);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn write_file_rejects_symlinked_final_component() {
+        // Writing *through* an outbound symlink must be refused — the
+        // read path rejects the same shape via canonicalize.
+        let wd = tmpwd();
+        let outside = tmpwd();
+        let victim = outside.join("real.txt");
+        fs::write(&victim, "original").unwrap();
+        std::os::unix::fs::symlink(&victim, wd.join("sneaky.txt")).unwrap();
+
+        let result = execute_write_file(&wd, "sneaky.txt", "overwritten");
+        assert!(result.starts_with("Error"), "got: {result}");
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "original",
+            "the symlink target must be untouched"
+        );
+
+        let _ = fs::remove_dir_all(&wd);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn write_file_reports_absolute_path_and_creates_subdirs() {
+        // Issue #16: the result carries the resolved absolute path, so
+        // "where did the file go" is answerable from the tool result; new
+        // subdirectories under the workdir still work.
+        let wd = tmpwd();
+        let result = execute_write_file(&wd, "new/sub/dir/file.txt", "x");
+        assert!(result.starts_with("wrote"), "got: {result}");
+        let absolute = wd.canonicalize().unwrap().join("new/sub/dir/file.txt");
+        assert!(
+            result.contains(&absolute.display().to_string()),
+            "result must contain the absolute path: {result}"
+        );
+        assert_eq!(fs::read_to_string(&absolute).unwrap(), "x");
 
         let _ = fs::remove_dir_all(&wd);
     }

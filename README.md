@@ -345,7 +345,7 @@ When the LLM supports function calling (Ollama with compatible models, OpenAI-co
 | `read_file` | Read file contents | Max 1MB, sandboxed to working dir |
 | `list_dir` | List directory tree | Max depth 3, max 200 entries |
 | `search_code` | Grep for patterns | Max 50 matches |
-| `write_file` | Create or overwrite a file | Max 5MB, sandboxed to working dir |
+| `write_file` | Create or overwrite a file | Max 5MB, sandboxed to working dir — `..` escapes, symlinked ancestors, and symlinked final components rejected; result reports the absolute path |
 | `edit` | Replace a unique substring in a file | Refuses ambiguous / missing matches |
 | `web_fetch` | Fetch a URL over HTTP/HTTPS | 5MB body, 30s timeout. Requires `LLM_WEB_ALLOWLIST` |
 | `bash` | Run a bash command in the working dir | Output truncated at 50 KB |
