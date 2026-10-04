@@ -451,7 +451,17 @@ pub enum StreamChunk {
     /// style) or `delta.reasoning` (some OpenAI-compatible servers).
     /// Display-only; the engine surface for this is `agent_thought_chunk`.
     Thinking(String),
-    Error(String),
+    /// A complete tool call, assembled from streamed fragments (or passed
+    /// through whole from backends that don't fragment). Full OpenAI
+    /// non-streaming shape: `{id?, type: "function", function: {name,
+    /// arguments}}` — consumers handle it exactly like
+    /// `Backend::extract_tool_calls` output.
+    ToolCall(Value),
+    /// Mid-stream failure with its transport-level classification. The
+    /// turn fails (never silently retried — a retry would re-generate
+    /// chunks the client already saw); the kind feeds the same
+    /// `data.category` error surface as setup-time failures.
+    Error(String, LlmErrorKind),
     Done,
 }
 
@@ -771,23 +781,176 @@ pub async fn stream_chat(
     messages: &[Value],
     model_override: Option<&str>,
 ) -> Result<mpsc::Receiver<StreamChunk>, LlmError> {
+    stream_chat_with_tools(config, messages, model_override, None).await
+}
+
+/// Stream a chat completion with optional tool definitions.
+///
+/// This is the streaming counterpart of [`chat`]: same body-building and
+/// retry/backoff rules, but the response is consumed as a stream and
+/// forwarded as [`StreamChunk`]s over a bounded channel:
+///
+/// - `Content` — text deltas (also used by Ollama native NDJSON)
+/// - `Thinking` — reasoning deltas (`delta.reasoning_content` /
+///   `delta.reasoning`)
+/// - `ToolCall` — complete tool calls. OpenAI-compatible servers stream
+///   them as indexed fragments (`delta.tool_calls`, first fragment carries
+///   `id` + `function.name`, later ones only `function.arguments` slices);
+///   they are accumulated here and emitted whole, so consumers see the
+///   same shape `Backend::extract_tool_calls` produces for a
+///   non-streaming response. Ollama native (NDJSON) does not fragment.
+/// - `Error` — mid-stream failure. The turn must fail; a silent retry
+///   would re-generate already-notified chunks.
+///
+/// The channel yields exactly one terminal event (`Error` or `Done`).
+pub async fn stream_chat_with_tools(
+    config: &LlmConfig,
+    messages: &[Value],
+    model_override: Option<&str>,
+    tools: Option<&[Value]>,
+) -> Result<mpsc::Receiver<StreamChunk>, LlmError> {
     let url = config.chat_url();
     let model = model_override.unwrap_or(&config.model);
     let is_native = config.is_ollama_native();
 
-    let body = build_body(config, messages, model, true, None);
+    let body = build_body(config, messages, model, true, tools);
     let response = send_with_retry(config, &url, &body, "stream_chat").await?;
 
     let (tx, rx) = mpsc::channel(256);
 
-    if is_native {
+    // Some servers accept `stream: true` but answer with a complete JSON
+    // body anyway (streaming unsupported or ignored behind a proxy). The
+    // SSE/NDJSON parsers would silently read zero lines from it and the
+    // turn would look like an empty response — sniff the content type and
+    // adapt the full response into chunks instead.
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // Some servers accept `stream: true` but answer with a complete JSON
+    // body anyway (streaming unsupported or ignored behind a proxy). The
+    // SSE/NDJSON parsers would silently read zero lines from it and the
+    // turn would look like an empty response. Adapt only when the body
+    // explicitly says `application/json` — everything else (event-stream,
+    // x-ndjson, missing header) keeps the streaming parsers.
+    let adapt_full = content_type.contains("application/json");
+
+    if adapt_full {
+        debug!(
+            content_type,
+            model, "Backend answered non-streamed; adapting full response"
+        );
+        let backend = config.backend();
+        tokio::spawn(async move {
+            match response.json::<Value>().await {
+                Ok(value) => adapt_full_response(backend, value, &tx).await,
+                Err(e) => {
+                    let _ = tx
+                        .send(StreamChunk::Error(
+                            format!("Non-streamed response body was not valid JSON: {e}"),
+                            LlmErrorKind::ParseError,
+                        ))
+                        .await;
+                    let _ = tx.send(StreamChunk::Done).await;
+                }
+            }
+        });
+    } else if is_native {
         tokio::spawn(parse_ollama_native_stream(response, tx));
+        info!(model, native = true, "Streaming started");
     } else {
         tokio::spawn(parse_openai_sse_stream(response, tx));
+        info!(model, native = false, "Streaming started");
     }
 
-    info!(model, native = is_native, "Streaming started");
     Ok(rx)
+}
+
+/// The engine-facing entry point for one tool-loop round: a streamed chat
+/// completion that degrades to the non-streaming path when the backend
+/// refuses streaming at setup time (HTTP error on the streaming request).
+///
+/// Fallback policy (issue #11): setup-time unavailability — the request
+/// itself fails before a single chunk is consumed — retries the round via
+/// non-streaming [`chat`] invisibly. Mid-stream failures are different:
+/// they surface as [`StreamChunk::Error`] and the turn fails, because a
+/// retry would re-generate and re-notify chunks the client already saw.
+pub async fn chat_streamed(
+    config: &LlmConfig,
+    messages: &[Value],
+    model_override: Option<&str>,
+    tools: Option<&[Value]>,
+) -> Result<mpsc::Receiver<StreamChunk>, LlmError> {
+    match stream_chat_with_tools(config, messages, model_override, tools).await {
+        Ok(rx) => Ok(rx),
+        Err(setup_err) => {
+            info!(
+                kind = setup_err.kind.as_str(),
+                "Streaming request failed at setup; falling back to non-streaming chat"
+            );
+            let response = chat(config, messages, model_override, tools).await?;
+            let (tx, rx) = mpsc::channel(256);
+            let backend = config.backend();
+            tokio::spawn(async move {
+                adapt_full_response(backend, response, &tx).await;
+            });
+            Ok(rx)
+        }
+    }
+}
+
+/// Convert a complete non-streaming response into the same chunk stream a
+/// streamed response produces, so the engine has a single consumption path
+/// for both wire behaviors.
+async fn adapt_full_response(backend: Backend, response: Value, tx: &mpsc::Sender<StreamChunk>) {
+    let reasoning = backend.extract_reasoning_text(&response);
+    if !reasoning.is_empty() {
+        let _ = tx.send(StreamChunk::Thinking(reasoning)).await;
+    }
+    let text = backend.extract_response_text(&response);
+    if !text.is_empty() {
+        let _ = tx.send(StreamChunk::Content(text)).await;
+    }
+    for call in backend.extract_tool_calls(&response) {
+        let _ = tx.send(StreamChunk::ToolCall(call)).await;
+    }
+    let _ = tx.send(StreamChunk::Done).await;
+}
+
+/// One streamed tool call being assembled from OpenAI `delta.tool_calls`
+/// fragments, keyed by the fragment `index`. The first fragment for an
+/// index carries `id` + `function.name`; later fragments append slices to
+/// `function.arguments`.
+#[derive(Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+/// Emit every accumulated tool call as a complete [`StreamChunk::ToolCall`],
+/// in fragment-index order — the same shape
+/// [`Backend::extract_tool_calls`] produces for a non-streaming response.
+async fn flush_tool_calls(
+    pending: &mut std::collections::BTreeMap<i64, PendingToolCall>,
+    tx: &mpsc::Sender<StreamChunk>,
+) {
+    for (_, entry) in std::mem::take(pending) {
+        if entry.name.is_none() && entry.arguments.is_empty() {
+            continue; // phantom index — a server emitted the key but never a call
+        }
+        let mut function = json!({ "arguments": entry.arguments });
+        if let Some(name) = entry.name {
+            function["name"] = json!(name);
+        }
+        let mut call = json!({ "type": "function", "function": function });
+        if let Some(id) = entry.id {
+            call["id"] = json!(id);
+        }
+        let _ = tx.send(StreamChunk::ToolCall(call)).await;
+    }
 }
 
 /// Parse Ollama native NDJSON streaming response.
@@ -805,7 +968,10 @@ async fn parse_ollama_native_stream(
                 if !buffer.push(&bytes) {
                     error!("Stream buffer exceeded limit, aborting");
                     let _ = tx
-                        .send(StreamChunk::Error("Stream buffer overflow".into()))
+                        .send(StreamChunk::Error(
+                            "Stream buffer overflow".into(),
+                            LlmErrorKind::ParseError,
+                        ))
                         .await;
                     return;
                 }
@@ -816,10 +982,27 @@ async fn parse_ollama_native_stream(
                     }
 
                     if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
-                        // Check if done
-                        if parsed.get("done").and_then(|d| d.as_bool()) == Some(true) {
-                            let _ = tx.send(StreamChunk::Done).await;
-                            return;
+                        // Reasoning deltas — Ollama thinking mode streams
+                        // them in `message.thinking` before the content.
+                        if let Some(text) = parsed
+                            .get("message")
+                            .and_then(|m| m.get("thinking"))
+                            .and_then(|t| t.as_str())
+                        {
+                            if !text.is_empty() {
+                                let _ = tx.send(StreamChunk::Thinking(text.to_string())).await;
+                            }
+                        }
+
+                        // Native tool calls arrive whole (not fragmented).
+                        if let Some(calls) = parsed
+                            .get("message")
+                            .and_then(|m| m.get("tool_calls"))
+                            .and_then(|t| t.as_array())
+                        {
+                            for call in calls {
+                                let _ = tx.send(StreamChunk::ToolCall(call.clone())).await;
+                            }
                         }
 
                         // Extract content from message.content
@@ -832,6 +1015,13 @@ async fn parse_ollama_native_stream(
                                 let _ = tx.send(StreamChunk::Content(text.to_string())).await;
                             }
                         }
+
+                        // Check if done — after extraction, so a final
+                        // chunk that still carries a call is not dropped.
+                        if parsed.get("done").and_then(|d| d.as_bool()) == Some(true) {
+                            let _ = tx.send(StreamChunk::Done).await;
+                            return;
+                        }
                     }
                 }
             }
@@ -841,19 +1031,36 @@ async fn parse_ollama_native_stream(
             }
             Err(e) => {
                 error!(error = %e, "Stream chunk error");
-                let _ = tx.send(StreamChunk::Error(e.to_string())).await;
-                break;
+                let kind = if e.is_timeout() {
+                    LlmErrorKind::Timeout
+                } else {
+                    LlmErrorKind::Unreachable
+                };
+                let _ = tx.send(StreamChunk::Error(e.to_string(), kind)).await;
+                return;
             }
         }
     }
 
-    let _ = tx.send(StreamChunk::Done).await;
+    // Reaching EOF means the terminal sentinel (`done: true`) never
+    // arrived — a connection that closes mid-stream (server crash, proxy
+    // timeout) must fail the round, not yield a silently truncated
+    // "completed" turn (issue #11).
+    error!("Ollama native stream ended without done:true");
+    let _ = tx
+        .send(StreamChunk::Error(
+            "Stream ended before the terminal done:true sentinel".into(),
+            LlmErrorKind::Unreachable,
+        ))
+        .await;
 }
 
 /// Parse OpenAI-compatible SSE streaming response.
 /// Each line: "data: {json}" or "data: [DONE]"
 async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Sender<StreamChunk>) {
     let mut buffer = LineBuffer::default();
+    let mut pending_tools: std::collections::BTreeMap<i64, PendingToolCall> =
+        std::collections::BTreeMap::new();
 
     loop {
         let chunk_result: Result<Option<bytes::Bytes>, reqwest::Error> = response.chunk().await;
@@ -862,7 +1069,10 @@ async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Send
                 if !buffer.push(&bytes) {
                     error!("Stream buffer exceeded limit, aborting");
                     let _ = tx
-                        .send(StreamChunk::Error("Stream buffer overflow".into()))
+                        .send(StreamChunk::Error(
+                            "Stream buffer overflow".into(),
+                            LlmErrorKind::ParseError,
+                        ))
                         .await;
                     return;
                 }
@@ -874,6 +1084,7 @@ async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Send
 
                     let data = &line[6..];
                     if data == "[DONE]" {
+                        flush_tool_calls(&mut pending_tools, &tx).await;
                         let _ = tx.send(StreamChunk::Done).await;
                         return;
                     }
@@ -904,6 +1115,39 @@ async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Send
                                 let _ = tx.send(StreamChunk::Content(text.to_string())).await;
                             }
                         }
+
+                        // Tool-call fragments accumulate by index and are
+                        // flushed as complete calls when the stream ends.
+                        if let Some(fragments) = delta
+                            .and_then(|d| d.get("tool_calls"))
+                            .and_then(|t| t.as_array())
+                        {
+                            for fragment in fragments {
+                                let index =
+                                    fragment.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
+                                let entry = pending_tools.entry(index).or_default();
+                                if let Some(id) = fragment.get("id").and_then(|v| v.as_str()) {
+                                    if !id.is_empty() {
+                                        entry.id = Some(id.to_string());
+                                    }
+                                }
+                                let function = fragment.get("function");
+                                if let Some(name) = function
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    if !name.is_empty() {
+                                        entry.name = Some(name.to_string());
+                                    }
+                                }
+                                if let Some(args) = function
+                                    .and_then(|f| f.get("arguments"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    entry.arguments.push_str(args);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -913,13 +1157,30 @@ async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Send
             }
             Err(e) => {
                 error!(error = %e, "Stream chunk error");
-                let _ = tx.send(StreamChunk::Error(e.to_string())).await;
-                break;
+                let kind = if e.is_timeout() {
+                    LlmErrorKind::Timeout
+                } else {
+                    LlmErrorKind::Unreachable
+                };
+                let _ = tx.send(StreamChunk::Error(e.to_string(), kind)).await;
+                return;
             }
         }
     }
 
-    let _ = tx.send(StreamChunk::Done).await;
+    // EOF is only a normal end when the terminal sentinel arrived
+    // Reaching EOF means the terminal sentinel (`data: [DONE]`) never
+    // arrived — a connection that closes mid-stream (server crash, proxy
+    // timeout) must fail the round, not yield a silently truncated
+    // "completed" turn (issue #11). Buffered tool-call fragments from a
+    // truncated stream are discarded with it.
+    error!("SSE stream ended without [DONE] sentinel");
+    let _ = tx
+        .send(StreamChunk::Error(
+            "Stream ended before the terminal [DONE] sentinel".into(),
+            LlmErrorKind::Unreachable,
+        ))
+        .await;
 }
 #[cfg(test)]
 mod tests {
@@ -1261,12 +1522,211 @@ mod tests {
             match chunk {
                 StreamChunk::Thinking(t) => thinking.push_str(&t),
                 StreamChunk::Content(c) => content.push_str(&c),
+                StreamChunk::ToolCall(_) => {}
                 StreamChunk::Done => break,
-                StreamChunk::Error(e) => panic!("unexpected stream error: {e}"),
+                StreamChunk::Error(e, _) => panic!("unexpected stream error: {e}"),
             }
         }
         assert_eq!(thinking, "pondering");
         assert_eq!(content, "Answer");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_assembles_tool_call_fragments() {
+        // GLM/OpenAI-style streaming tool calls: the first fragment for an
+        // index carries id + name + the first arguments slice; later
+        // fragments append argument slices. Captured live from
+        // GLM-5.3-Flash on CometAPI (issue #11 probe).
+        async fn sse() -> impl IntoResponse {
+            let frag = |idx: i64, id: &str, name: &str, args: &str| {
+                format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"delta": {"tool_calls": [{"index": idx, "id": id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": args}}]}}]})
+                )
+            };
+            let chunks = vec![
+                format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"delta": {"reasoning_content": "need the file"}}]})
+                ),
+                frag(0, "call_abc", "read_file", "{\"pa"),
+                frag(0, "", "", "th\": \"/tmp"),
+                frag(0, "", "", "/x.txt\"}"),
+                frag(1, "call_def", "list_dir", "{\"path\":\"/tmp\"}"),
+                "data: [DONE]\n\n".to_string(),
+            ];
+            let stream = futures_lite::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+            );
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        let url = serve(Router::new().route("/v1/chat/completions", post(sse))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let mut rx = stream_chat(&cfg, &[], None).await.unwrap();
+
+        let mut reasoning_before_calls = false;
+        let mut calls: Vec<Value> = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                StreamChunk::Thinking(_) => reasoning_before_calls = calls.is_empty(),
+                StreamChunk::ToolCall(call) => calls.push(call),
+                StreamChunk::Done => break,
+                StreamChunk::Content(_) => {}
+                StreamChunk::Error(e, _) => panic!("unexpected stream error: {e}"),
+            }
+        }
+        assert!(reasoning_before_calls, "thinking must precede tool calls");
+        assert_eq!(calls.len(), 2, "calls: {calls:?}");
+        assert_eq!(calls[0]["id"], "call_abc");
+        assert_eq!(calls[0]["function"]["name"], "read_file");
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            r#"{"path": "/tmp/x.txt"}"#
+        );
+        assert_eq!(calls[1]["id"], "call_def");
+        assert_eq!(calls[1]["function"]["name"], "list_dir");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_classifies_mid_stream_error() {
+        // Transport dies mid-stream: the chunk must carry a classified
+        // LlmErrorKind so the turn's data.category contract holds. A raw
+        // TCP server sends a valid SSE head + one data chunk, then resets
+        // the connection (RST) — hyper's EOF handling would otherwise be
+        // free to treat a plain close as a complete body.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+            let body = format!(
+                "data: {}\n\n",
+                json!({"choices": [{"delta": {"content": "partial"}}]})
+            );
+            use tokio::io::AsyncWriteExt;
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.flush().await;
+            // Close without the [DONE] sentinel — since issue #11, EOF
+            // without the sentinel is classified as a mid-stream failure
+            // (server crash / proxy timeout), not a normal end.
+            drop(sock);
+        });
+
+        let cfg = test_config(&format!("http://{addr}/v1"));
+        let mut rx = stream_chat(&cfg, &[], None).await.unwrap();
+
+        let mut saw_content = false;
+        let mut saw_terminal_error = false;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                StreamChunk::Content(_) => saw_content = true,
+                StreamChunk::Error(msg, kind) => {
+                    saw_terminal_error = true;
+                    assert_eq!(kind, LlmErrorKind::Unreachable, "msg: {msg}");
+                }
+                StreamChunk::Done => break,
+                _ => {}
+            }
+        }
+        assert!(saw_content, "expected the first chunk before the failure");
+        assert!(saw_terminal_error, "expected a classified mid-stream error");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_adapts_non_streamed_json_body() {
+        // A server that ignores `stream: true` and answers with a complete
+        // JSON body must still yield a usable chunk stream (issue #11
+        // fallback policy — setup-time adaptation, no turn failure).
+        async fn plain_json() -> impl IntoResponse {
+            axum::Json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": "2+2=4",
+                        "content": "4"
+                    },
+                    "finish_reason": "stop"
+                }]
+            }))
+        }
+        let url = serve(Router::new().route("/v1/chat/completions", post(plain_json))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let mut rx = stream_chat(&cfg, &[], None).await.unwrap();
+
+        let mut order: Vec<&str> = Vec::new();
+        let mut content = String::new();
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                StreamChunk::Thinking(_) => order.push("thinking"),
+                StreamChunk::Content(c) => {
+                    order.push("content");
+                    content.push_str(&c);
+                }
+                StreamChunk::Done => break,
+                StreamChunk::ToolCall(_) => {}
+                StreamChunk::Error(e, _) => panic!("unexpected stream error: {e}"),
+            }
+        }
+        assert_eq!(content, "4");
+        assert_eq!(order, vec!["thinking", "content"]);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_native_passes_whole_tool_calls_and_thinking() {
+        // Ollama native NDJSON: tool calls arrive whole (not fragmented);
+        // thinking-mode models stream message.thinking before content.
+        async fn ndjson() -> impl IntoResponse {
+            let lines = vec![
+                format!(
+                    "{}\n",
+                    json!({"message": {"thinking": "hmm"}, "done": false})
+                ),
+                format!(
+                    "{}\n",
+                    json!({"message": {"tool_calls": [{"function": {"name": "list_dir",
+                        "arguments": {"path": "/tmp"}}}]}, "done": false})
+                ),
+                format!("{}\n", json!({"done": true})),
+            ];
+            let stream = futures_lite::stream::iter(
+                lines.into_iter().map(Ok::<_, std::convert::Infallible>),
+            );
+            Response::builder()
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        // No /v1 suffix → Ollama native NDJSON parser.
+        let url = serve(Router::new().route("/api/chat", post(ndjson))).await;
+        let cfg = test_config(&url);
+        let mut rx = stream_chat(&cfg, &[], None).await.unwrap();
+
+        let mut thinking = String::new();
+        let mut calls: Vec<Value> = Vec::new();
+        let mut done = false;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                StreamChunk::Thinking(t) => thinking.push_str(&t),
+                StreamChunk::ToolCall(call) => calls.push(call),
+                StreamChunk::Done => {
+                    done = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(thinking, "hmm");
+        assert_eq!(calls.len(), 1, "calls: {calls:?}");
+        // Ollama native carries arguments as a JSON object — preserved as-is.
+        assert_eq!(calls[0]["function"]["name"], "list_dir");
+        assert_eq!(calls[0]["function"]["arguments"]["path"], "/tmp");
+        assert!(done);
     }
 
     #[tokio::test]
@@ -1327,11 +1787,12 @@ mod tests {
             match chunk {
                 StreamChunk::Content(c) => text.push_str(&c),
                 StreamChunk::Thinking(t) => text.push_str(&t),
+                StreamChunk::ToolCall(_) => {}
                 StreamChunk::Done => {
                     done = true;
                     break;
                 }
-                StreamChunk::Error(e) => panic!("unexpected stream error: {e}"),
+                StreamChunk::Error(e, _) => panic!("unexpected stream error: {e}"),
             }
         }
         (text, done)

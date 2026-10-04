@@ -381,8 +381,8 @@ the matching wire shape from the same code base.
 
 | Notification | Discriminator | Status |
 |--------------|---------------|--------|
-| Streaming text chunk | `agent_message_chunk` (v1 + v2) | Always emitted while the model is generating |
-| Streaming thought chunk | `agent_thought_chunk` (v1 + v2) | Emitted at prompt start so Clients can render the thought bubble. Additionally, when the backend returns model reasoning separate from the answer (`message.reasoning_content` on OpenAI-compatible servers, `message.thinking` on Ollama native), each round emits an `agent_thought_chunk` carrying that text — display-only, never fed back into the conversation history |
+| Streaming text chunk | `agent_message_chunk` (v1 + v2) | Emitted per text delta. The engine's tool loop runs on streamed rounds, so the answer streams incrementally instead of arriving as one blob at turn end |
+| Streaming thought chunk | `agent_thought_chunk` (v1 + v2) | Model reasoning streams delta-by-delta while the model thinks (`delta.reasoning_content` / `delta.reasoning` on OpenAI-compatible servers, `message.thinking` on Ollama native); non-streaming backends surface the round's reasoning as one chunk before the answer. Display-only, never fed back into the conversation history |
 | Tool call start (v1) | `tool_call` | Carries `toolCallId`, `title`, `kind`, `status: "in_progress"` |
 | Tool call start (v2) | `tool_call_update` (upsert) | Same fields. v2 removed the legacy `tool_call` discriminator. |
 | Tool call update | `tool_call_update` (v1 + v2) | Carries the new `status` (`pending` / `in_progress` / `completed` / `failed`) |

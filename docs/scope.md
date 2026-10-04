@@ -35,7 +35,7 @@ spec-compliant v2 payloads.
 |---|---|---|
 | `initialize` | ✅ | Negotiates v1/v2; emits the corresponding `agentCapabilities` + `agentInfo` shape (v1) or `capabilities` + `info` shape (v2) |
 | `session/new` | ✅ | Multi-session with per-session conversation history. `mcpServers` accepted but ignored (acp-bridge does not relay MCP) |
-| `session/prompt` | ✅ | Streaming via SSE → `session/update` notifications. v1 final response carries `stopReason` (`end_turn` / `max_turn_requests`). v2 final response carries `messageId` and the turn end is reported via `state_update` (per schema) |
+| `session/prompt` | ✅ | The tool loop runs on streamed rounds (issue #11): reasoning and answer text arrive as incremental chunk notifications; streamed tool-call fragments are assembled and executed like non-streaming calls; backends that reject `stream: true` fall back to non-streaming; a stream that dies mid-round fails the turn. v1 final response carries `stopReason` (`end_turn` / `max_turn_requests`). v2 final response carries `messageId` and the turn end is reported via `state_update` (per schema) |
 | `session/cancel` notification | ✅ | Acknowledged with a log line; in-flight cancellation is not yet implemented |
 | `session/end` (v1) / `session/close` (v2 baseline) | ✅ | Removes the session and frees its history. Both methods share the same implementation |
 | `session/list` (v2 baseline) | ✅ | Returns currently active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}` |

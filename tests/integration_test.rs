@@ -4,7 +4,7 @@
 use axum::{
     body::Body,
     extract::{Request, State},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -609,6 +609,326 @@ async fn test_thinking_text_surfaces_as_agent_thought_chunk() {
     // The turn still completes normally with the final answer as text.
     assert_eq!(response["result"]["status"], "completed");
     assert_eq!(response["result"]["text"], "Hello!");
+
+    h.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #11: engine tool loop runs on streamed rounds
+// ---------------------------------------------------------------------------
+
+fn sse_response(chunks: Vec<Value>) -> Response {
+    let lines: Vec<String> = chunks
+        .into_iter()
+        .map(|c| format!("data: {}\n\n", c))
+        .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+        .collect();
+    let stream =
+        futures_lite::stream::iter(lines.into_iter().map(Ok::<_, std::convert::Infallible>));
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_streamed_round_emits_incremental_thought_and_answer_chunks() {
+    // True streaming (issue #11): reasoning deltas arrive as separate
+    // agent_thought_chunks while the model thinks; the answer arrives as
+    // multiple agent_message_chunks, not one blob. The turn's final text
+    // equals the concatenation of the answer chunks.
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                sse_response(vec![
+                    json!({"choices": [{"delta": {"reasoning_content": "step one; "}}]}),
+                    json!({"choices": [{"delta": {"reasoning_content": "step two."}}]}),
+                    json!({"choices": [{"delta": {"content": "Hello "}}]}),
+                    json!({"choices": [{"delta": {"content": "streamed "}}]}),
+                    json!({"choices": [{"delta": {"content": "world"}}]}),
+                ])
+            }),
+        )
+        .route("/api/tags", get(mock_ollama_tags));
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hi"}]}
+    }));
+
+    let (notifications, response) = h.read_until_response(2);
+
+    let mut thoughts: Vec<&str> = Vec::new();
+    let mut answers: Vec<&str> = Vec::new();
+    for m in &notifications {
+        let u = &m["params"]["update"];
+        match u["sessionUpdate"].as_str() {
+            Some("agent_thought_chunk") => {
+                if let Some(t) = u["content"]["text"].as_str() {
+                    if !t.is_empty() {
+                        thoughts.push(t);
+                    }
+                }
+            }
+            Some("agent_message_chunk") => {
+                answers.push(u["content"]["text"].as_str().unwrap_or_default());
+            }
+            _ => {}
+        }
+    }
+
+    // One chunk per delta — not a single aggregate blob.
+    assert_eq!(thoughts, vec!["step one; ", "step two."], "thought chunks");
+    assert_eq!(
+        answers,
+        vec!["Hello ", "streamed ", "world"],
+        "answer chunks"
+    );
+
+    // All thought chunks precede all answer chunks (chronological order).
+    let first_answer = notifications
+        .iter()
+        .position(|m| m["params"]["update"]["sessionUpdate"] == "agent_message_chunk");
+    let last_thought = notifications
+        .iter()
+        .rposition(|m| m["params"]["update"]["sessionUpdate"] == "agent_thought_chunk");
+    assert!(last_thought < first_answer);
+
+    // The turn completes and the final text is the full answer.
+    assert_eq!(response["result"]["status"], "completed");
+    assert_eq!(response["result"]["text"], "Hello streamed world");
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_streamed_tool_call_fragments_execute() {
+    // Round 1 arrives as OpenAI indexed tool-call fragments (id + name on
+    // the first fragment, argument slices after — captured live from
+    // GLM-5.3-Flash); the engine must assemble the call, execute list_dir,
+    // and complete on round 2's streamed answer.
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(
+                move |req: Request<Body>| async move {
+                    let body_bytes =
+                        axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap();
+                    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                    let has_tool_result = body["messages"]
+                        .as_array()
+                        .map(|msgs| msgs.iter().any(|m| m["role"] == "tool"))
+                        .unwrap_or(false);
+
+                    if !has_tool_result {
+                        sse_response(vec![
+                            json!({"choices": [{"delta": {"tool_calls": [
+                                {"index": 0, "id": "call_frag", "type": "function",
+                                 "function": {"name": "list_dir", "arguments": "{\"pa"}}]}}]}),
+                            json!({"choices": [{"delta": {"tool_calls": [
+                                {"index": 0, "function": {"name": "", "arguments": "th\": \".\"}"}}]}}]}),
+                        ])
+                    } else {
+                        sse_response(vec![
+                            json!({"choices": [{"delta": {"content": "seen "}}]}),
+                            json!({"choices": [{"delta": {"content": "the listing"}}]}),
+                        ])
+                    }
+                },
+            ),
+        )
+        .with_state(call_count);
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"list it"}]}
+    }));
+
+    let (notifications, response) = h.read_until_response(2);
+
+    // The streamed tool call was assembled and surfaced as a tool_call /
+    // tool_call_update pair with the right id and name.
+    let tool_start = notifications.iter().any(|m| {
+        let u = &m["params"]["update"];
+        u["sessionUpdate"] == "tool_call" && u["toolCallId"] == "call_frag"
+            || u["sessionUpdate"] == "tool_call_update"
+                && u["toolCallId"] == "call_frag"
+                && u["title"] == "list_dir"
+    });
+    assert!(
+        tool_start,
+        "expected a tool notification for call_frag; got {notifications:?}"
+    );
+
+    // Round 2 ran: the answer is the streamed concatenation.
+    assert_eq!(response["result"]["status"], "completed");
+    assert_eq!(response["result"]["text"], "seen the listing");
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mid_stream_error_fails_turn_without_retry() {
+    // Mid-stream failure (issue #11 pinned policy): the turn fails with
+    // the same error surface as the non-streaming path, and the engine
+    // does NOT retry the round (a retry would re-notify chunks the client
+    // already saw). A partial chunk is delivered before the failure.
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let counter = call_count.clone();
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(move |req: Request<Body>| {
+                let counter = counter.clone();
+                async move {
+                    // Drain and ignore the body; count the request.
+                    let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    // application/json + invalid JSON body: the adapt path
+                    // fails parsing the body → classified mid-stream error.
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        "{not valid json",
+                    )
+                }
+            }),
+        );
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hi"}]}
+    }));
+    let (notifications, response) = h.read_until_response(2);
+
+    assert_eq!(response["result"]["status"], "failed");
+    // Exactly one request — no silent round retry.
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "retry would duplicate chunks"
+    );
+
+    // The error text is surfaced as a message chunk with the stable
+    // category name (parse_error), same as the non-streaming error path.
+    let err_chunk = notifications.iter().any(|m| {
+        m["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            && m["params"]["update"]["content"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Error (parse_error)")
+    });
+    assert!(
+        err_chunk,
+        "expected the classified error chunk; got {notifications:?}"
+    );
+    assert_eq!(response["result"]["error"]["category"], "parse_error");
+    assert_eq!(response["result"]["error"]["retryable"], false);
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_streaming_unsupported_falls_back_to_non_streaming() {
+    // Setup-time fallback (issue #11 pinned policy): a backend that
+    // rejects `stream: true` with 400 does not fail the turn — the round
+    // is retried invisibly via the non-streaming path before any
+    // notification is sent.
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(|req: Request<Body>| async move {
+                let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                if body["stream"] == json!(true) {
+                    axum::http::StatusCode::BAD_REQUEST.into_response()
+                } else {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "fallback answer"},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hi"}]}
+    }));
+    let (notifications, response) = h.read_until_response(2);
+
+    assert_eq!(response["result"]["status"], "completed");
+    assert_eq!(response["result"]["text"], "fallback answer");
+    // The fallback answer was surfaced exactly once as a message chunk.
+    let answer_chunks = notifications
+        .iter()
+        .filter(|m| {
+            m["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                && m["params"]["update"]["content"]["text"] == "fallback answer"
+        })
+        .count();
+    assert_eq!(answer_chunks, 1, "got {notifications:?}");
 
     h.shutdown();
 }

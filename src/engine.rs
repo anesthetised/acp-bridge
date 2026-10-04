@@ -613,121 +613,163 @@ pub async fn session_prompt(
         };
 
         let backend = state.config.backend();
-        let chat_result = llm::chat(&state.config, &messages, None, Some(&tool_defs)).await;
+        let (mut rx, mut round_error) =
+            match llm::chat_streamed(&state.config, &messages, None, Some(&tool_defs)).await {
+                Ok(rx) => (Some(rx), None),
+                Err(e) => (None, Some(e)),
+            };
 
-        match chat_result {
-            Ok(response) => {
-                let tool_calls = backend.extract_tool_calls(&response);
-
-                // Surface the model's reasoning for this round, if the
-                // backend provided any. Emitted before the final text (or
-                // before the tool calls execute) so clients show the
-                // thinking in chronological order. Display-only: reasoning
-                // text is never appended to the session history — upstreams
-                // either reject it in follow-up turns or mis-handle it.
-                let reasoning = backend.extract_reasoning_text(&response);
-                if !reasoning.is_empty() {
-                    notify(Notification::ThinkingText { text: reasoning });
-                }
-
-                if tool_calls.is_empty() {
-                    got_final_response = true;
-                    let text = backend.extract_response_text(&response);
-                    if !text.is_empty() {
-                        final_text = text.clone();
-                        {
-                            let mut sessions = state.sessions_write();
-                            if let Some(session) = sessions.get_mut(session_id) {
-                                session
-                                    .messages
-                                    .push(json!({"role": "assistant", "content": &text}));
-                            }
-                        }
-                        notify(Notification::TextChunk(text));
+        // Drain this round's stream. Parsers guarantee Thinking before
+        // Content before ToolCall and exactly one terminal event (Error
+        // or Done). Reasoning and text are notified as they arrive — the
+        // point of the streaming loop (issue #11) — while the accumulated
+        // forms feed the session history and the turn result.
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        let mut tool_calls: Vec<Value> = Vec::new();
+        if let Some(rx) = rx.as_mut() {
+            while let Some(chunk) = rx.recv().await {
+                match chunk {
+                    llm::StreamChunk::Thinking(t) => {
+                        reasoning.push_str(&t);
+                        notify(Notification::ThinkingText { text: t });
                     }
-                    break;
+                    llm::StreamChunk::Content(t) => {
+                        content.push_str(&t);
+                        notify(Notification::TextChunk(t));
+                    }
+                    llm::StreamChunk::ToolCall(call) => tool_calls.push(call),
+                    llm::StreamChunk::Error(message, kind) => {
+                        round_error = Some(crate::llm::LlmError {
+                            kind,
+                            message,
+                            status: None,
+                        });
+                    }
+                    llm::StreamChunk::Done => break,
                 }
+            }
+        }
 
-                // Execute tool calls
-                info!(round, count = tool_calls.len(), "Executing tool calls");
+        if let Some(e) = round_error {
+            // Classify the LLM error so the response can carry a
+            // structured `data.category` field that Clients can
+            // switch on without parsing prose. See
+            // `LlmErrorKind::as_str()` for the stable category names.
+            // Covers both setup-time failures (request rejected before
+            // any chunk) and mid-stream failures — the latter fail the
+            // turn instead of retrying, because a retry would re-generate
+            // chunks the client already saw (issue #11 fallback policy).
+            let kind = e.kind.clone();
+            let retryable = e.kind.is_retryable();
+            let err_msg = format!(
+                "\n\n**Error ({}):** {}\n{}",
+                e.kind.as_str(),
+                e.message,
+                if retryable {
+                    "_Hint: this is a transient error; the same prompt may succeed on retry._"
+                } else {
+                    "_Hint: this error is not retryable; check the model name, base URL, or prompt shape._"
+                }
+            );
+            notify(Notification::TextChunk(err_msg.clone()));
+            final_text = err_msg;
+            had_error = true;
+            last_error_class = Some(kind);
+            error!(
+                kind = e.kind.as_str(),
+                status = ?e.status,
+                retryable,
+                "LLM communication failed"
+            );
+            break;
+        }
 
+        if tool_calls.is_empty() {
+            got_final_response = true;
+            if !content.is_empty() {
+                final_text = content.clone();
                 {
                     let mut sessions = state.sessions_write();
                     if let Some(session) = sessions.get_mut(session_id) {
-                        let assistant_msg =
-                            backend.format_assistant_message("", &tool_calls, &response);
-                        session.messages.push(assistant_msg);
+                        session
+                            .messages
+                            .push(json!({"role": "assistant", "content": &content}));
                     }
                 }
-
-                for tc in &tool_calls {
-                    let func = &tc["function"];
-                    let name = func["name"].as_str().unwrap_or("unknown");
-                    // `function.arguments` can be either a JSON-encoded
-                    // string (OpenAI-compatible backends) or a JSON
-                    // object (Ollama native /api/chat). Handle both —
-                    // the previous `as_str().unwrap_or("{}")` silently
-                    // dropped every Ollama native tool call's actual
-                    // arguments (see review §"既有 bug 未修").
-                    let args: Value = match func.get("arguments") {
-                        Some(Value::String(s)) => serde_json::from_str(s)
-                            .unwrap_or_else(|_| Value::Object(Default::default())),
-                        Some(Value::Object(_)) | Some(Value::Array(_)) => func["arguments"].clone(),
-                        Some(_) | None => Value::Object(Default::default()),
-                    };
-                    let tool_call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-
-                    notify(Notification::ToolStart {
-                        id: tool_call_id.to_string(),
-                        name: name.into(),
-                    });
-                    let result = tools::execute_tool(&working_dir, name, &args);
-                    notify(Notification::ToolDone {
-                        id: tool_call_id.to_string(),
-                        name: name.into(),
-                        status: "completed".into(),
-                    });
-
-                    debug!(tool = name, result_len = result.len(), "Tool executed");
-
-                    {
-                        let mut sessions = state.sessions_write();
-                        if let Some(session) = sessions.get_mut(session_id) {
-                            session
-                                .messages
-                                .push(backend.format_tool_result(tool_call_id, &result));
-                        }
-                    }
-                }
+                // The text was already notified delta-by-delta above; no
+                // additional aggregate chunk here (the client would see
+                // the answer twice).
             }
-            Err(e) => {
-                // Classify the LLM error so the response can carry a
-                // structured `data.category` field that Clients can
-                // switch on without parsing prose. See
-                // `LlmErrorKind::as_str()` for the stable category names.
-                let kind = e.kind.clone();
-                let retryable = e.kind.is_retryable();
-                let err_msg = format!(
-                    "\n\n**Error ({}):** {}\n{}",
-                    e.kind.as_str(),
-                    e.message,
-                    if retryable {
-                        "_Hint: this is a transient error; the same prompt may succeed on retry._"
-                    } else {
-                        "_Hint: this error is not retryable; check the model name, base URL, or prompt shape._"
-                    }
-                );
-                notify(Notification::TextChunk(err_msg.clone()));
-                final_text = err_msg;
-                had_error = true;
-                last_error_class = Some(kind);
-                error!(
-                    kind = e.kind.as_str(),
-                    status = ?e.status,
-                    retryable,
-                    "LLM communication failed"
-                );
-                break;
+            break;
+        }
+
+        // Execute tool calls
+        info!(round, count = tool_calls.len(), "Executing tool calls");
+
+        {
+            let mut sessions = state.sessions_write();
+            if let Some(session) = sessions.get_mut(session_id) {
+                // No raw response exists in the streaming path — assemble
+                // the assistant message from the accumulated round data in
+                // the shape each backend expects. OpenAI-compatible
+                // upstreams carry `content: null` on tool-call turns.
+                let content_value = if content.is_empty() {
+                    Value::Null
+                } else {
+                    json!(content)
+                };
+                let synthetic = json!({
+                    "choices": [{"message": {
+                        "role": "assistant",
+                        "content": content_value,
+                        "tool_calls": tool_calls,
+                    }}]
+                });
+                let assistant_msg =
+                    backend.format_assistant_message(&content, &tool_calls, &synthetic);
+                session.messages.push(assistant_msg);
+            }
+        }
+
+        for tc in &tool_calls {
+            let func = &tc["function"];
+            let name = func["name"].as_str().unwrap_or("unknown");
+            // `function.arguments` can be either a JSON-encoded
+            // string (OpenAI-compatible backends) or a JSON
+            // object (Ollama native /api/chat). Handle both —
+            // the previous `as_str().unwrap_or("{}")` silently
+            // dropped every Ollama native tool call's actual
+            // arguments (see review §"既有 bug 未修").
+            let args: Value = match func.get("arguments") {
+                Some(Value::String(s)) => {
+                    serde_json::from_str(s).unwrap_or_else(|_| Value::Object(Default::default()))
+                }
+                Some(Value::Object(_)) | Some(Value::Array(_)) => func["arguments"].clone(),
+                Some(_) | None => Value::Object(Default::default()),
+            };
+            let tool_call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+            notify(Notification::ToolStart {
+                id: tool_call_id.to_string(),
+                name: name.into(),
+            });
+            let result = tools::execute_tool(&working_dir, name, &args);
+            notify(Notification::ToolDone {
+                id: tool_call_id.to_string(),
+                name: name.into(),
+                status: "completed".into(),
+            });
+
+            debug!(tool = name, result_len = result.len(), "Tool executed");
+
+            {
+                let mut sessions = state.sessions_write();
+                if let Some(session) = sessions.get_mut(session_id) {
+                    session
+                        .messages
+                        .push(backend.format_tool_result(tool_call_id, &result));
+                }
             }
         }
 
