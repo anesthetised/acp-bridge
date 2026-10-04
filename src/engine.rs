@@ -198,6 +198,14 @@ pub fn extract_user_images_from_prompt(prompt: &Value) -> Vec<ImageBlock> {
 #[derive(Debug, Clone)]
 pub enum Notification {
     Thinking,
+    /// Model reasoning ("thinking") text captured from the backend for the
+    /// current round — `message.reasoning_content` (OpenAI-compatible,
+    /// DeepSeek/GLM-style), `message.thinking` (Ollama native), or streamed
+    /// reasoning deltas. Display-only: never appended to session history
+    /// and never treated as the final answer.
+    ThinkingText {
+        text: String,
+    },
     ToolStart {
         /// ACP v1 `toolCallId` — required for clients to pair tool_call /
         /// tool_call_update updates. The LLM assigns this id per call; for
@@ -610,6 +618,17 @@ pub async fn session_prompt(
         match chat_result {
             Ok(response) => {
                 let tool_calls = backend.extract_tool_calls(&response);
+
+                // Surface the model's reasoning for this round, if the
+                // backend provided any. Emitted before the final text (or
+                // before the tool calls execute) so clients show the
+                // thinking in chronological order. Display-only: reasoning
+                // text is never appended to the session history — upstreams
+                // either reject it in follow-up turns or mis-handle it.
+                let reasoning = backend.extract_reasoning_text(&response);
+                if !reasoning.is_empty() {
+                    notify(Notification::ThinkingText { text: reasoning });
+                }
 
                 if tool_calls.is_empty() {
                     got_final_response = true;

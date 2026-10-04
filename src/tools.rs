@@ -1117,6 +1117,7 @@ fn execute_git(working_dir: &Path, args: &[&str]) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard};
 
     /// Serializes tests that mutate process-global environment variables.
@@ -1130,9 +1131,17 @@ mod tests {
     }
 
     fn tmpwd() -> PathBuf {
+        // Unique per call: pid + timestamp + an atomic counter. Timestamps
+        // alone are not enough — several tests start on parallel threads
+        // and can observe the same nanosecond, yielding colliding directory
+        // names. Then one test's `remove_dir_all(&wd)` cleanup deletes
+        // another test's workspace mid-run ("No such file or directory"
+        // panics roughly 1 run in 10).
+        static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "acp-bridge-tools-test-{}-{}",
+            "acp-bridge-tools-test-{}-{}-{}",
             std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

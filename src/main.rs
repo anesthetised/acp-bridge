@@ -573,6 +573,7 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
     while let Some(notif) = notify_rx.recv().await {
         match notif {
             Notification::Thinking => acp::notify_thinking_for(state.protocol_version, &session_id),
+            Notification::ThinkingText { text } => acp::notify_thinking_text(&session_id, &text),
             Notification::ToolStart { id, name } => {
                 acp::notify_tool_start_for(state.protocol_version, &session_id, &id, &name)
             }
