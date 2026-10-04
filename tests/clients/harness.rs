@@ -69,6 +69,9 @@ impl Agent {
             // discipline is preserved (tracing writes structured records; we
             // don't want to dump them into the test runner's stdout).
             .env("RUST_LOG", "off")
+            // Persistence writes to the user's real session DB by
+            // default (issue #17) — tests must stay isolated.
+            .env("ACP_PERSISTENCE", "off")
             .env_remove("LLM_SUPPORTS_IMAGE");
         for (k, v) in extra_env {
             cmd.env(k, v);

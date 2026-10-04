@@ -6,9 +6,8 @@ to set expectations when a Client picks acp-bridge from the ACP registry or
 launches it as a subprocess.
 
 acp-bridge positions itself as a **minimal ACP adapter for local AI**, not
-a full agent runtime. Anything that would require persistence, an external
-auth provider, or a hosted control-plane surface is intentionally out of
-scope.
+a full agent runtime. Anything that would require an external auth
+provider or a hosted control-plane surface is intentionally out of scope.
 
 ## Protocol versions
 
@@ -39,8 +38,9 @@ spec-compliant v2 payloads.
 | `session/cancel` notification | ✅ | Acknowledged with a log line; in-flight cancellation is not yet implemented |
 | `session/end` (v1) / `session/close` (v2 baseline) | ✅ | Removes the session and frees its history. Both methods share the same implementation |
 | `session/list` (v2 baseline) | ✅ | Returns currently active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}` |
-| Streaming `agent_message_chunk` | ✅ | Typed `content: {type: "text", text: …}`. v1 and v2 use the same discriminator |
-| `agent_thought_chunk` | ✅ | Typed `content: {type: "text", text: ""}` — emitted so Clients render the thought bubble. Backend reasoning text (`message.reasoning_content` / `message.thinking` / `delta.reasoning_content`) is surfaced as non-empty thought chunks before the final answer; display-only, never appended to session history |
+| Streaming `agent_message_chunk` | ✅ | Typed `content: {type: "text", text: …}`. The engine's tool loop runs on streamed rounds, so answer text arrives incrementally. v1 and v2 use the same discriminator |
+| `session/load` / `session/resume` | ✅ | Sessions persist in SQLite (bundled, WAL) — one row per session, saved after every completed tool round, pruned to last 100 at startup. `session/load` restores and **replays the full timeline** (user chunks → `tool_call`/`tool_call_update` pairs → agent chunks) before responding, per spec; `session/resume` restores without replay. `loadSession` + `sessionCapabilities.resume` advertised; `ACP_SESSION_DB` overrides the DB path, `ACP_PERSISTENCE=off` disables and reverts to the `no_persistence` rejections |
+| `agent_thought_chunk` | ✅ | Typed `content: {type: "text", text: ""}` — emitted so Clients render the thought bubble. Model reasoning streams delta-by-delta while thinking (backend `message.reasoning_content` / `message.thinking` / `delta.reasoning_content`); display-only, never appended to session history |
 | `tool_call` (v1) / `tool_call_update` (v1 + v2) | ✅ | Carries `toolCallId`, `name`, human-readable `title`, `kind`, `status`, plus optional specifics: `rawInput` (model's arguments), `locations` (path-carrying tools), and on completion `rawOutput` + text `content` (preview-capped). Real `failed` status when the tool errored. v1 Clients see `tool_call`; v2 Clients see only `tool_call_update` with `status: "in_progress"` |
 | `plan` (v1) / `plan_update` (v2) | ✅ | `plan_update` carries `plan: {type: "items", planId, entries[]}` so v2 Clients can track multiple plans |
 | `available_commands_update` (v1 + v2) | ✅ | Slash-command menu: `/read`, `/ls`, `/search`, `/edit`, `/shell` |
@@ -84,10 +84,10 @@ error.
 
 | Method | Reason | Error code |
 |---|---|---|
-| `session/load` | acp-bridge has no persistence layer | `-32001` (`data.reason: "no_persistence"`) |
-| `session/resume` | acp-bridge has no persistence layer | `-32001` (`data.reason: "no_persistence"`) |
 | `session/delete` (v2 optional) | No persistence to delete from; use `session/close` instead | `-32601` (`data.reason: "not_implemented"`) |
 | `session/set_mode` | `session/new` does not return a `modes` array | `-32602` (`data.reason: "no_modes"`) |
+| `session/load` / `session/resume` with cwd mismatch | Persisted sessions re-anchor to their original working dir; silently re-anchoring would break tool sandboxing | `-32001` (message names both cwds) |
+| `session/load` / `session/resume` with persistence disabled (`ACP_PERSISTENCE=off`) | Legacy opt-out behavior | `-32001` (`data.reason: "no_persistence"`) |
 | `auth/login` | `initialize` returns `authMethods: []` | `-32601` (`data.reason: "no_auth_methods"`) |
 | `auth/logout` | Same | `-32601` (`data.reason: "no_auth_methods"`) |
 | `fs/read_text_file`, `fs/write_text_file` | acp-bridge never requests client-side file operations | `-32601` (`data.reason: "agent_does_not_call_client_fs"`) |
@@ -100,9 +100,22 @@ above are a safety net for Clients that don't.
 
 ## Things acp-bridge is not
 
-- **Not a session database.** Restart the agent and all sessions are gone.
-  If you need persistence, point acp-bridge at an external ACP-compatible
-  agent that does (e.g. Claude Code, Codex CLI, OpenCode).
+- **Not a hosted session database.** Sessions persist locally in SQLite
+  (issue #17) — they survive agent restarts on the same machine. There
+  is no hosted control plane, no cross-machine sync, no sharing between
+  different Client instances beyond what the local store allows.
+
+### Why persistence lives in this layer (design rationale)
+
+The ACP protocol gives Clients **no method to inject conversation
+history** — the only restore mechanisms are `session/load` /
+`session/resume`, and both place the burden on the Agent. The state
+being persisted is also Agent-owned: the assembled model context
+(system prompt, tool results in backend shape), which the Client never
+sees and could not reconstruct from its own transcript. Within the
+protocol as specified, agent-side persistence is therefore the only
+possible home for restore. Revisit if ACP ever adds client-side
+history injection.
 - **Not an auth provider.** No login flow, no token storage, no user
   identity. If you need per-user sessions, route through a Client that
   gates on its own identity.

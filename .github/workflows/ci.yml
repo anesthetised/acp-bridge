@@ -4,63 +4,57 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
+  # Deny warnings in CI so unused variables / new clippy lints surface as
+  # failures rather than noise in PR review.
+  RUSTFLAGS: "-D warnings"
 
 jobs:
-  check:
-    name: Check + Test
-    runs-on: ubuntu-latest
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS for the Apple Silicon primary target; Linux for the
+        # air-gapped/server deployment story.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
-      - name: Cache cargo
+      - name: Cache cargo registry + target
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
+            ~/.cargo/registry/index
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
-      - name: Check (warnings = errors)
-        run: cargo check --all-targets 2>&1
+      - name: Format
+        run: cargo fmt --all -- --check
 
-      - name: Run tests
-        run: cargo test -- --test-threads=1
+      # `bundled` SQLite compiles from source — give the C toolchain a
+      # moment; needs cc/clang which both runners have by default.
+      - name: Build (tests included)
+        run: cargo build --all-targets --locked
 
-      - name: Build release
-        run: cargo build --release
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
 
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+        # The suite binds ephemeral 127.0.0.1 ports and spawns agent
+        # subprocesses; no external services needed (LLM_BASE_URL points
+        # at a closed port by default in harnesses).
 
-  fmt:
-    name: Rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --check
