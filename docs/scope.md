@@ -57,7 +57,7 @@ spec-compliant v2 payloads.
 | `read_file` | Read a file (sandboxed, max 1 MB) |
 | `list_dir` | List directory contents (max 4 levels, max 200 entries) |
 | `search_code` | Grep for a literal string in files under the working dir (max 50 matches). Symlinks are skipped; depth is bounded |
-| `write_file` | Create or overwrite a file (max 5 MB). Sandbox rejects `..` escapes |
+| `write_file` | Create or overwrite a file (max 5 MB). Sandbox rejects `..` escapes, symlinked ancestors, and symlinked final components — resolved target must stay inside the working dir. Result reports the absolute path written |
 | `edit` | Replace a unique substring in a file. Fails on missing / ambiguous / empty matches |
 | `web_fetch` | HTTP/HTTPS GET with HTML reduction. **Off by default** — requires `LLM_WEB_ALLOWLIST`. Redirects are limited to 5 hops and re-validated against the allowlist on every hop |
 | `bash` | Run a bash command. Note: no OS-level sandbox, no timeout enforcement (see "Things acp-bridge is not") |

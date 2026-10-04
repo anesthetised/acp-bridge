@@ -7,6 +7,22 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **write_file sandbox hardening** — the write path was weaker than the
+  read path: it rejected `..` but not symlinked ancestors, so a
+  directory symlink inside the working dir could carry a write outside
+  the sandbox silently, and writing through an outbound file symlink
+  modified files outside the sandbox. The target is now verified
+  **before any filesystem mutation** (deepest existing ancestor
+  canonicalized and containment-checked; symlinked final components
+  refused, matching read_file's canonicalize semantics), so a rejected
+  write has zero side effects. Legitimate new-file-in-new-subdir writes
+  are unaffected. Tool results now report the **absolute resolved
+  path**, so a model whose mental cwd has drifted can self-correct —
+  and "where did my file go" is answerable from the result alone.
+  (#16)
+
 ### Added
 
 - **Tool calls are inspectable on the wire** — `tool_call` /
