@@ -35,13 +35,13 @@ spec-compliant v2 payloads.
 |---|---|---|
 | `initialize` | ✅ | Negotiates v1/v2; emits the corresponding `agentCapabilities` + `agentInfo` shape (v1) or `capabilities` + `info` shape (v2) |
 | `session/new` | ✅ | Multi-session with per-session conversation history. `mcpServers` accepted but ignored (acp-bridge does not relay MCP) |
-| `session/prompt` | ✅ | Streaming via SSE → `session/update` notifications. v1 final response carries `stopReason` (`end_turn` / `max_turn_requests`). v2 final response carries `messageId` and the turn end is reported via `state_update` (per schema) |
+| `session/prompt` | ✅ | The tool loop runs on streamed rounds (issue #11): reasoning and answer text arrive as incremental chunk notifications; streamed tool-call fragments are assembled and executed like non-streaming calls; backends that reject `stream: true` fall back to non-streaming; a stream that dies mid-round fails the turn. v1 final response carries `stopReason` (`end_turn` / `max_turn_requests`). v2 final response carries `messageId` and the turn end is reported via `state_update` (per schema) |
 | `session/cancel` notification | ✅ | Acknowledged with a log line; in-flight cancellation is not yet implemented |
 | `session/end` (v1) / `session/close` (v2 baseline) | ✅ | Removes the session and frees its history. Both methods share the same implementation |
 | `session/list` (v2 baseline) | ✅ | Returns currently active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}` |
 | Streaming `agent_message_chunk` | ✅ | Typed `content: {type: "text", text: …}`. v1 and v2 use the same discriminator |
 | `agent_thought_chunk` | ✅ | Typed `content: {type: "text", text: ""}` — emitted so Clients render the thought bubble. Backend reasoning text (`message.reasoning_content` / `message.thinking` / `delta.reasoning_content`) is surfaced as non-empty thought chunks before the final answer; display-only, never appended to session history |
-| `tool_call` (v1) / `tool_call_update` (v1 + v2) | ✅ | Carries the required `toolCallId`, `title`, `kind`, `status`. v1 Clients see `tool_call`; v2 Clients see only `tool_call_update` with `status: "in_progress"` |
+| `tool_call` (v1) / `tool_call_update` (v1 + v2) | ✅ | Carries `toolCallId`, `name`, human-readable `title`, `kind`, `status`, plus optional specifics: `rawInput` (model's arguments), `locations` (path-carrying tools), and on completion `rawOutput` + text `content` (preview-capped). Real `failed` status when the tool errored. v1 Clients see `tool_call`; v2 Clients see only `tool_call_update` with `status: "in_progress"` |
 | `plan` (v1) / `plan_update` (v2) | ✅ | `plan_update` carries `plan: {type: "items", planId, entries[]}` so v2 Clients can track multiple plans |
 | `available_commands_update` (v1 + v2) | ✅ | Slash-command menu: `/read`, `/ls`, `/search`, `/edit`, `/shell` |
 | `session_info_update` (v1 + v2) | ✅ | Title defaults to cwd basename, updated to first line of user prompt after each turn |

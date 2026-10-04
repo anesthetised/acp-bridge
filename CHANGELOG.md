@@ -9,6 +9,35 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Tool calls are inspectable on the wire** — `tool_call` /
+  `tool_call_update` notifications now carry the spec-optional specifics
+  Clients need to render what a tool is doing: `name` (programmatic), a
+  human-readable `title` with the key argument ("Read src/main.rs",
+  "Bash: git status" — previously the bare tool name), `rawInput` (the
+  model's arguments), `locations` for path-carrying tools, and on
+  completion the result as `rawOutput` plus a text `content` block
+  (preview-capped at 8 KB — the model receives the full result).
+  Detected tool failures now report `status: "failed"` instead of an
+  unconditional `completed`. All new fields are additive; Clients
+  ignoring them see the old behavior. (#14)
+
+- **The engine's tool loop now runs on streamed rounds** — each round
+  consumes the backend's streamed response, so model reasoning arrives as
+  incremental `agent_thought_chunk`s while the model thinks and the final
+  answer as multiple `agent_message_chunk`s instead of one blob at turn
+  end. Streamed tool-call fragments (OpenAI `delta.tool_calls`, indexed —
+  first fragment carries `id` + `function.name`, later fragments append
+  argument slices; verified live against GLM-5.3-Flash on CometAPI) are
+  accumulated by index and executed exactly like non-streaming calls.
+  Ollama native NDJSON streams `message.thinking` and whole tool calls.
+  Fallback policy: backends that reject `stream: true` (or answer with a
+  complete JSON body despite it) are adapted to the non-streaming path
+  invisibly; a stream that dies mid-round fails the turn with the same
+  classified `data.category` error surface as any other backend error —
+  never a silent retry (it would duplicate already-notified chunks), and
+  an EOF without the terminal sentinel is a failure, not a truncated
+  success. (#11)
+
 - **Model reasoning surfaced as thought chunks** — when a backend returns
   the model's reasoning separate from the final answer, the engine now
   emits it as `agent_thought_chunk` text (ordered before the answer /
