@@ -29,6 +29,9 @@ pub struct LlmSection {
     pub max_tokens: Option<u64>,
     pub timeout_secs: Option<u64>,
     pub max_history_turns: Option<usize>,
+    /// Maximum tool call rounds per prompt (0 = unlimited). Mirrors the
+    /// `LLM_MAX_TOOL_ROUNDS` env var; the env var takes precedence.
+    pub max_tool_rounds: Option<usize>,
     pub max_sessions: Option<usize>,
     pub session_idle_timeout_secs: Option<u64>,
     /// Whether the backend accepts image content blocks. Mirrors the
@@ -110,6 +113,12 @@ impl ConfigFile {
             .or(file.max_history_turns)
             .unwrap_or(50);
 
+        let max_tool_rounds = std::env::var("LLM_MAX_TOOL_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(file.max_tool_rounds)
+            .unwrap_or(crate::engine::DEFAULT_MAX_TOOL_ROUNDS);
+
         let max_sessions = std::env::var("LLM_MAX_SESSIONS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -149,6 +158,7 @@ impl ConfigFile {
             max_tokens,
             timeout_secs,
             max_history_turns,
+            max_tool_rounds,
             max_sessions,
             session_idle_timeout_secs,
             prompt_supports_image,
@@ -207,5 +217,41 @@ mod tests {
         assert_eq!(llm.system_prompt.as_deref(), Some("from env"));
 
         std::env::remove_var("LLM_SYSTEM_PROMPT");
+    }
+
+    #[test]
+    fn llm_config_max_tool_rounds_precedence() {
+        // Mutates LLM_MAX_TOOL_ROUNDS — must hold ENV_LOCK like the other
+        // env-touching tests in this module.
+        let _env = env_guard();
+
+        // 1. Default (25) when neither env nor file is set.
+        std::env::remove_var("LLM_MAX_TOOL_ROUNDS");
+        let llm = ConfigFile::default().into_llm_config();
+        assert_eq!(llm.max_tool_rounds, 25);
+
+        // 2. File value used when the env var is absent. (A closure, not a
+        // value: `into_llm_config` takes ownership, and the same fixture is
+        // reused across the precedence scenarios below.)
+        let file_only = || ConfigFile {
+            llm: LlmSection {
+                max_tool_rounds: Some(7),
+                ..LlmSection::default()
+            },
+        };
+        let llm = file_only().into_llm_config();
+        assert_eq!(llm.max_tool_rounds, 7);
+
+        // 3. Env wins over the file.
+        std::env::set_var("LLM_MAX_TOOL_ROUNDS", "3");
+        let llm = file_only().into_llm_config();
+        assert_eq!(llm.max_tool_rounds, 3);
+
+        // 0 = unlimited is preserved through the precedence chain.
+        std::env::set_var("LLM_MAX_TOOL_ROUNDS", "0");
+        let llm = file_only().into_llm_config();
+        assert_eq!(llm.max_tool_rounds, 0);
+
+        std::env::remove_var("LLM_MAX_TOOL_ROUNDS");
     }
 }

@@ -16,8 +16,15 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Maximum number of tool call rounds to prevent infinite loops.
-const MAX_TOOL_ROUNDS: usize = 5;
+/// Default maximum number of tool call rounds per prompt, used when neither
+/// the config file nor the environment specifies a value. The limit is a
+/// backstop against degenerate models that never stop requesting tools — it
+/// bounds API spend, process lifetime, and the time until the Client gets a
+/// final response (surfaced as ACP `stopReason: "max_turn_requests"`).
+/// Strong agentic models routinely need 6–15 rounds for real tasks, so the
+/// default is deliberately generous; tune it down via
+/// `LLM_MAX_TOOL_ROUNDS` / `[llm] max_tool_rounds` for small local models.
+pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 25;
 
 /// Extract concatenated text from a slice of ACP/A2A content parts.
 ///
@@ -570,8 +577,20 @@ pub async fn session_prompt(
     let mut last_error_class: Option<crate::llm::LlmErrorKind> = None;
     let tool_defs = tools::tool_definitions();
 
-    // Tool call loop
-    for round in 0..MAX_TOOL_ROUNDS {
+    // Per-turn tool-call round budget. `0` disables the cap entirely —
+    // symmetric with `max_history_turns` / `max_sessions`. Only for
+    // trusted setups: a degenerate model that never stops requesting
+    // tools will then loop (and spend) until the client disconnects.
+    let max_tool_rounds = state.config.max_tool_rounds;
+
+    // Tool call loop. Structured as a `loop` (not a ranged `for`) so the
+    // budget can distinguish "capped at N rounds" from `0` = unlimited,
+    // symmetric with `max_history_turns` / `max_sessions`.
+    let mut round = 0usize;
+    loop {
+        if max_tool_rounds > 0 && round >= max_tool_rounds {
+            break;
+        }
         let (messages, working_dir) = {
             let sessions = state.sessions_read();
             match sessions.get(session_id) {
@@ -692,19 +711,23 @@ pub async fn session_prompt(
                 break;
             }
         }
+
+        round += 1;
     }
 
-    // The loop can also exit by exhausting MAX_TOOL_ROUNDS while the model
-    // keeps requesting tools. Without this the turn would be reported as a
-    // successful "completed" with empty text, silently swallowing the fact
-    // that the model never produced a final answer.
+    // The loop can also exit by exhausting the per-turn round budget while
+    // the model keeps requesting tools. Without this the turn would be
+    // reported as a successful "completed" with empty text, silently
+    // swallowing the fact that the model never produced a final answer.
+    // (When `max_tool_rounds` is 0 the loop has no cap and can only exit
+    // via a final response or an LLM error.)
     if !had_error && !got_final_response {
         warn!(
-            max_rounds = MAX_TOOL_ROUNDS,
+            max_rounds = max_tool_rounds,
             "Tool-call loop hit round limit without a final response"
         );
         let msg = format!(
-            "\n\n**Error:** reached the tool-call limit ({MAX_TOOL_ROUNDS} rounds) without a final answer\n"
+            "\n\n**Error:** reached the tool-call limit ({max_tool_rounds} rounds) without a final answer\n_Hint: raise `LLM_MAX_TOOL_ROUNDS` (env) or `[llm] max_tool_rounds` (config) if your model needs more rounds._\n"
         );
         notify(Notification::TextChunk(msg.clone()));
         final_text = msg;
@@ -1040,6 +1063,7 @@ mod tests {
             max_tokens: None,
             timeout_secs: 5,
             max_history_turns: 50,
+            max_tool_rounds: 25,
             max_sessions: 0,
             session_idle_timeout_secs: 0,
             prompt_supports_image: supports_image,

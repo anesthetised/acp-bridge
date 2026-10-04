@@ -223,6 +223,7 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `LLM_MAX_TOKENS` | (model default) | Maximum tokens to generate |
 | `LLM_TIMEOUT` | `300` | HTTP request timeout in seconds |
 | `LLM_MAX_HISTORY_TURNS` | `50` | Max conversation turns to keep (0 = unlimited) |
+| `LLM_MAX_TOOL_ROUNDS` | `25` | Max tool-call rounds per prompt — the per-turn backstop against models that never stop requesting tools; exhaustion surfaces as ACP `stopReason: "max_turn_requests"` (0 = unlimited) |
 | `LLM_MAX_SESSIONS` | `0` | Max concurrent sessions (0 = unlimited) |
 | `LLM_SESSION_IDLE_TIMEOUT` | `0` | Evict idle sessions after N seconds (0 = disabled) |
 | `LLM_SUPPORTS_IMAGE` | `false` | Opt-in: advertise `promptCapabilities.image: true` at `initialize`. Set to `true` only if the configured backend can actually accept image content blocks (e.g. a vision-capable model). |

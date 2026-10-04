@@ -294,6 +294,12 @@ pub struct LlmConfig {
     pub timeout_secs: u64,
     /// Maximum conversation turns to keep (0 = unlimited).
     pub max_history_turns: usize,
+    /// Maximum number of tool call rounds per prompt (0 = unlimited).
+    /// Backstop against degenerate models that never stop requesting
+    /// tools; surfaced as ACP `stopReason: "max_turn_requests"` when
+    /// exhausted. Override via `LLM_MAX_TOOL_ROUNDS` env var or the
+    /// `[llm] max_tool_rounds` config key; default 25.
+    pub max_tool_rounds: usize,
     /// Maximum number of concurrent sessions (0 = unlimited).
     pub max_sessions: usize,
     /// Session idle timeout in seconds (0 = no timeout).
@@ -376,6 +382,10 @@ impl LlmConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50),
+            max_tool_rounds: std::env::var("LLM_MAX_TOOL_ROUNDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::engine::DEFAULT_MAX_TOOL_ROUNDS),
             max_sessions: std::env::var("LLM_MAX_SESSIONS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -936,6 +946,7 @@ mod tests {
             max_tokens: None,
             timeout_secs: 5,
             max_history_turns: 50,
+            max_tool_rounds: 25,
             max_sessions: 0,
             session_idle_timeout_secs: 0,
             prompt_supports_image: false,

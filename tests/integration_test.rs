@@ -1121,10 +1121,16 @@ async fn mock_chat_completions_always_tool() -> impl IntoResponse {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tool_round_limit_surfaces_failure() {
     let port = free_port();
+    // Pin the budget explicitly so the test exercises the env-var plumbing
+    // (`LLM_MAX_TOOL_ROUNDS`) rather than the default, and so a future
+    // default change cannot silently invalidate the round count below.
     let mut h = TestHarness::start_with_router_and_env(
         port,
         mock_llm_always_tool_router(),
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+        &[
+            ("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1")),
+            ("LLM_MAX_TOOL_ROUNDS", "5"),
+        ],
     )
     .await;
 
@@ -1153,6 +1159,72 @@ async fn test_tool_round_limit_surfaces_failure() {
             .contains("tool-call limit"),
         "Expected tool-call limit message, got: {:?}",
         response["result"]["text"]
+    );
+    // The configured budget (from LLM_MAX_TOOL_ROUNDS above) must be
+    // reported in the message, proving the value is plumbed end-to-end.
+    assert!(
+        response["result"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("(5 rounds)"),
+        "Expected the configured round count in the message, got: {:?}",
+        response["result"]["text"]
+    );
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tool_round_limit_configurable() {
+    let port = free_port();
+    // A budget of 2 rounds must exhaust after exactly 2 tool-call rounds —
+    // a default of 5 would need 5. Proves the value is honored, not just
+    // reported.
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_always_tool_router(),
+        &[
+            ("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1")),
+            ("LLM_MAX_TOOL_ROUNDS", "2"),
+        ],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"loop forever"}]}
+    }));
+
+    let (notifications, response) = h.read_until_response(2);
+
+    assert_eq!(response["result"]["status"], "failed");
+    assert!(
+        response["result"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("(2 rounds)"),
+        "Expected exhaustion after the configured 2 rounds, got: {:?}",
+        response["result"]["text"]
+    );
+    // Each round executes one `list_dir` tool call; 2 rounds => exactly 2
+    // list_dir tool_call starts. (The turn is also wrapped in a synthetic
+    // `llm_chat` tool_call notification, which is excluded by title.)
+    // Note the wire shape: the session-update payload is nested under
+    // params.update, mirroring send_session_update in src/acp.rs.
+    let tool_starts = notifications
+        .iter()
+        .filter(|n| {
+            n["params"]["update"]["sessionUpdate"] == "tool_call"
+                && n["params"]["update"]["title"] == "list_dir"
+        })
+        .count();
+    assert_eq!(
+        tool_starts, 2,
+        "Expected exactly 2 tool-call rounds, got: {tool_starts}"
     );
 
     h.shutdown();

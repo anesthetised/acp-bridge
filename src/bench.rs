@@ -327,6 +327,7 @@ mod tests {
             max_tokens: None,
             timeout_secs: 5,
             max_history_turns: 50,
+            max_tool_rounds: 25,
             max_sessions: 0,
             session_idle_timeout_secs: 0,
             prompt_supports_image: false,

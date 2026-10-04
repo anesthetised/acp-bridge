@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Configurable tool-call round limit** — new `[llm] max_tool_rounds`
+  config key and `LLM_MAX_TOOL_ROUNDS` env var (env > config file >
+  default, matching the existing precedence chain). The per-turn
+  tool-call loop in the engine now reads the budget from `LlmConfig`
+  instead of the hard-coded `MAX_TOOL_ROUNDS = 5` constant. Default is
+  25 — strong agentic models routinely need 6–15 rounds for real tasks
+  and the old default aborted them with "reached the tool-call limit
+  (5 rounds)". `0` disables the cap, symmetric with
+  `max_history_turns` / `max_sessions`. The exhaustion message reports
+  the configured value and names the knob to raise it. The cap itself
+  stays: it bounds API spend and time-to-response for degenerate models
+  and maps to ACP `stopReason: "max_turn_requests"`. (#1)
+
 ## [0.9.1] - 2026-10-03
 
 ### Fixed — ACP v2 wire-shape blockers
