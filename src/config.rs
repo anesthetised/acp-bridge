@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 use crate::llm::LlmConfig;
 use reqwest::Client;
+use serde_json::Value;
 use std::time::Duration;
 
 /// On-disk config file structure.
@@ -43,6 +44,14 @@ pub struct LlmSection {
     /// `usage_update` notifications.
     #[serde(default)]
     pub model_context: Option<u64>,
+    /// Arbitrary passthrough fields merged into the top level of every
+    /// upstream request body (issue #2) — e.g. `reasoning_effort`,
+    /// `top_p`. Applied last, so overrides win over built-in sampling
+    /// fields; reserved engine-owned keys (`model`, `messages`,
+    /// `stream`, `tools`) are ignored with a warning. No env var:
+    /// structural config, not a secret.
+    #[serde(default)]
+    pub request_overrides: Option<serde_json::Map<String, Value>>,
 }
 
 impl ConfigFile {
@@ -163,6 +172,9 @@ impl ConfigFile {
             session_idle_timeout_secs,
             prompt_supports_image,
             context_size,
+            // Issue #2: request overrides are config-only (structural
+            // passthrough, not a secret) — no env var by design.
+            request_overrides: file.request_overrides.unwrap_or_default(),
             client,
         }
     }

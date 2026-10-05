@@ -72,6 +72,7 @@ spec-compliant v2 payloads.
 | ACP surface | Caveat | How to enable |
 |---|---|---|
 | Image content blocks (`ContentBlock::Image`) | Off by default. Turning it on without a vision-capable backend causes Clients (Meuxe, ACP UI, …) to forward images that the LLM cannot parse | Set `LLM_SUPPORTS_IMAGE=true` or `[llm].supports_image = true` |
+| Backend request overrides | Applied last and win over built-in sampling fields; reserved keys (`model`, `messages`, `stream`, `tools`) ignored with a warning — engine-owned per-round | `[llm.request_overrides]` table in the TOML config (issue #2); no env var by design |
 | `session/prompt` with audio / embedded resource content | Not parsed; audio/resource blocks are silently dropped from the prompt | Out of scope; document if you need it |
 | `mcpServers` on `session/new` | Accepted for spec compatibility but **not relayed** to the underlying LLM. The agent uses its own built-in tool set | Future work; tracked but not scheduled |
 

@@ -1548,6 +1548,7 @@ mod tests {
             session_idle_timeout_secs: 0,
             prompt_supports_image: supports_image,
             context_size: 32768,
+            request_overrides: serde_json::Map::new(),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
