@@ -38,6 +38,19 @@ pub struct LlmSection {
     /// Whether the backend accepts image content blocks. Mirrors the
     /// `LLM_SUPPORTS_IMAGE` env var; the env var takes precedence.
     #[serde(default)]
+    pub prompt_supports_image: Option<bool>,
+    /// Compaction trigger as a fraction of the context window (issue
+    /// #25): when a round's reported prompt tokens cross this share of
+    /// `context_size`, older rounds are summarized into a rolling
+    /// note before the next request. `0` disables compaction. Default
+    /// 0.75 when unset.
+    pub compaction_threshold: Option<f64>,
+    /// Model used for the summarization call (issue #25). Default:
+    /// the configured model. Intended for a cheaper dedicated
+    /// summarizer on gateways where one exists.
+    pub compaction_model: Option<String>,
+    /// Whether the backend accepts image content blocks.
+    #[serde(default)]
     pub supports_image: Option<bool>,
     /// Model context window in tokens. Mirrors the `LLM_MODEL_CONTEXT` env
     /// var; the env var takes precedence. Reported as `size` in
@@ -215,6 +228,10 @@ impl ConfigFile {
             session_idle_timeout_secs,
             prompt_supports_image,
             context_size,
+            // Issue #25: compaction. 0 = disabled; None = default 0.75.
+            // The summarizer model defaults to the configured model.
+            compaction_threshold: file.compaction_threshold.filter(|t| *t >= 0.0 && *t <= 1.0),
+            compaction_model: file.compaction_model,
             thought_levels,
             thought_levels_set,
             // Issue #40: filled in by main after the startup probe.

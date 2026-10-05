@@ -100,6 +100,12 @@ pub struct Session {
     /// to the config default on `session/load` after a restart (pinned
     /// decision on #13).
     pub thought_level: Option<String>,
+    /// Context occupancy of the most recent round, in prompt tokens as
+    /// reported by the backend (issue #4/#25): the compaction trigger
+    /// reads this instead of re-estimating. `None` until a backend
+    /// reports usage; compaction then falls back to the chars/4
+    /// estimate. Updated at turn end.
+    pub last_used_tokens: Option<u64>,
     /// Per-session model override (issue #40): set by
     /// `session/set_config_option(configId: "model")` from the
     /// Client's model picker, applied to every round's request body
@@ -121,6 +127,7 @@ impl Session {
             protocol_version,
             thought_level: None,
             model_override: None,
+            last_used_tokens: None,
         }
     }
 
@@ -142,6 +149,21 @@ impl Session {
             self.messages = vec![system];
             self.messages.extend(tail);
         }
+    }
+
+    /// Compat boundary (issue #25): compaction replaces `trim_history`'s
+    /// scissors when enabled — split index for the messages older than
+    /// the last N turns, or `None` when history fits without cutting.
+    /// Only tool-aware rounds (the agentic shape: user → tool-calling
+    /// assistant → tool results → … → final assistant) start before
+    /// the boundary; a cut is only *placed* at round boundaries, so
+    /// tool results are never orphaned from their assistant request.
+    pub fn compaction_split(&self, max_turns: usize) -> Option<usize> {
+        let keep = max_turns * 2;
+        if self.messages.len() <= keep + 1 {
+            return None;
+        }
+        Some(self.messages.len() - keep)
     }
 }
 

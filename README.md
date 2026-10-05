@@ -262,6 +262,17 @@ top_p = 0.95
 
 Overrides are applied **last** (they win over built-in `temperature` / `max_tokens`); reserved engine-owned keys (`model`, `messages`, `stream`, `tools`) are ignored with a warning; Ollama-native bodies get the same top-level merge only (override `options` as a whole object if needed).
 
+#### Context compaction
+
+When a round's reported prompt tokens cross **75%** of the model window
+(`[llm] compaction_threshold`, fraction of `context_size`, `0` = off),
+acp-bridge summarizes everything older than the recent tail into a
+rolling note — replacing the blunt hard-delete at `max_history_turns`.
+The summarizer uses the configured model unless `[llm] compaction_model`
+points at a cheaper one. A one-line note appears in the transcript when
+this happens, so context loss is never silent. Summarizer failures
+degrade to no-op; the trigger re-arms for the next turn.
+
 #### Per-session thought levels (bb reasoning-effort picker)
 
 Opt in by advertising levels:
