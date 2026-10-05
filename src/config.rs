@@ -190,6 +190,8 @@ impl ConfigFile {
             prompt_supports_image,
             context_size,
             thought_levels,
+            // Issue #40: filled in by main after the startup probe.
+            available_models: Vec::new(),
             // Issue #2: request overrides are config-only (structural
             // passthrough, not a secret) — no env var by design.
             request_overrides: file.request_overrides.unwrap_or_default(),

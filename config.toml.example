@@ -48,13 +48,12 @@ max_tool_rounds = 25
 
 # Reasoning-effort levels advertised to Clients as a `thought_level`
 # config option (issue #13, bb's reasoning-effort picker). Opt-in:
-# omit (or leave empty) and nothing is advertised. When set,
-# session/new also advertises a single-entry `model` option — bb's
-# picker pipeline requires both (it probes the model option and reads
-# the level back). Selecting a level in the Client UI sends
-# session/set_config_option; every subsequent round's body carries
-# reasoning_effort: <level> for that session (beats the
-# request_overrides default above). In-memory per session.
+# omit (or leave empty) and the thought-level picker is not advertised.
+# (`session/new` always advertises the `model` option listing the
+# backend's models — issue #40, no config needed.) Selecting a level
+# in the Client UI sends session/set_config_option; every subsequent
+# round's body carries reasoning_effort: <level> for that session
+# (beats the request_overrides default above). In-memory per session.
 #
 # thought_levels = ["low", "high", "max"]
 

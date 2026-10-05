@@ -641,27 +641,44 @@ pub fn thought_level_config_option(state: &AppState, current: Option<&str>) -> O
 /// discovery path and never builds the reasoning-effort picker —
 /// advertising `thought_level` alone is not enough. acp-bridge offers
 /// exactly one model: the configured one.
-fn model_config_option(state: &AppState) -> Value {
+fn model_config_option(state: &AppState, current: Option<&str>) -> Value {
+    // Issue #40: advertise the real backend list (startup probe);
+    // configured model first when present. Empty list = probe failed
+    // → single configured model, as before.
+    let mut models = state.config.available_models.clone();
+    if !models.iter().any(|m| m == &state.config.model) {
+        models.insert(0, state.config.model.clone());
+    }
+    let current = current.unwrap_or(&state.config.model);
     json!({
         "id": "model",
         "name": "Model",
         "category": "model",
         "type": "select",
-        "currentValue": state.config.model,
-        "options": [{ "value": state.config.model, "name": state.config.model }],
+        "currentValue": current,
+        "options": models
+            .iter()
+            .map(|m| json!({ "value": m, "name": m }))
+            .collect::<Vec<_>>(),
     })
 }
 
 /// Both options bb's picker pipeline needs, in a fixed order (model
 /// first, thought level second). Called only when the feature is on.
-fn config_options_body(state: &AppState, current_level: Option<&str>) -> Value {
-    json!({
-        "configOptions": [
-            model_config_option(state),
-            thought_level_config_option(state, current_level)
-                .expect("feature is on, so the thought level option exists"),
-        ]
-    })
+fn config_options_body(
+    state: &AppState,
+    current_model: Option<&str>,
+    current_level: Option<&str>,
+) -> Value {
+    // The model option is always advertised (issue #40): the list
+    // comes from the startup probe, so model switching works with
+    // zero configuration. The thought_level option (issue #13) only
+    // when levels are configured.
+    let mut options = vec![model_config_option(state, current_model)];
+    if let Some(thought) = thought_level_config_option(state, current_level) {
+        options.push(thought);
+    }
+    json!({ "configOptions": options })
 }
 
 /// Build the `session/new` success response (issue #13): `sessionId`
@@ -670,15 +687,16 @@ fn config_options_body(state: &AppState, current_level: Option<&str>) -> Value {
 /// level). Without the feature the response is byte-identical to the
 /// historical `{"sessionId"}` shape.
 pub fn session_new_response(state: &AppState, session_id: &str) -> Value {
-    let current = state
+    let (current_model, current_level) = state
         .sessions_read()
         .get(session_id)
-        .and_then(|s| s.thought_level.clone());
+        .map(|s| (s.model_override.clone(), s.thought_level.clone()))
+        .unwrap_or((None, None));
     let mut body = json!({ "sessionId": session_id });
-    if !state.config.thought_levels.is_empty() {
-        body["configOptions"] =
-            config_options_body(state, current.as_deref())["configOptions"].clone();
-    }
+    body["configOptions"] =
+        config_options_body(state, current_model.as_deref(), current_level.as_deref())
+            ["configOptions"]
+            .clone();
     body
 }
 
@@ -692,30 +710,41 @@ pub fn session_set_config_option(
     config_id: &str,
     value: &Value,
 ) -> Result<Value, AcpError> {
-    if state.config.thought_levels.is_empty() {
-        return Err(AcpError::InvalidParam {
-            field: "configId: no config options advertised".into(),
-        });
-    }
     match config_id {
-        // bb's reasoning pipeline probes/selects the model through
-        // configId "model". We offer exactly the configured model, so
-        // a matching value is a no-op selection; anything else was
-        // never advertised.
+        // The Client's model picker (and bb's reasoning probe) select
+        // the model through configId "model". Accept anything the
+        // startup probe advertised (issue #40): store a per-session
+        // override applied via the existing model_override plumbing.
         "model" => {
             let requested = value.as_str().ok_or_else(|| AcpError::InvalidParam {
                 field: "value: expected a string model id".into(),
             })?;
-            if requested != state.config.model {
+            let mut offered = state.config.available_models.clone();
+            if !offered.iter().any(|m| m == &state.config.model) {
+                offered.insert(0, state.config.model.clone());
+            }
+            if !offered.iter().any(|m| m == requested) {
                 return Err(AcpError::InvalidParam {
                     field: format!(
-                        "value: '{requested}' is not offered; this agent runs '{}'",
-                        state.config.model
+                        "value: '{requested}' is not offered; available: {}",
+                        offered.join(", ")
                     ),
                 });
             }
+            let mut sessions = state.sessions_write();
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| AcpError::UnknownSession {
+                    session_id: session_id.to_string(),
+                })?;
+            session.model_override = Some(requested.to_string());
         }
         "thought_level" => {
+            if state.config.thought_levels.is_empty() {
+                return Err(AcpError::InvalidParam {
+                    field: "configId: no thought levels configured".into(),
+                });
+            }
             let Some(level) = value.as_str() else {
                 return Err(AcpError::InvalidParam {
                     field: "value: expected a string thought level".into(),
@@ -744,11 +773,16 @@ pub fn session_set_config_option(
         }
     }
 
-    let current = state
+    let (current_model, current_level) = state
         .sessions_read()
         .get(session_id)
-        .and_then(|s| s.thought_level.clone());
-    Ok(config_options_body(state, current.as_deref()))
+        .map(|s| (s.model_override.clone(), s.thought_level.clone()))
+        .unwrap_or((None, None));
+    Ok(config_options_body(
+        state,
+        current_model.as_deref(),
+        current_level.as_deref(),
+    ))
 }
 
 pub fn session_new_post_create_notifications(
@@ -971,13 +1005,15 @@ pub async fn session_prompt(
         let mut content = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut round_error: Option<crate::llm::LlmError> = None;
-        // Session thought level (issue #13): the Client's per-session
-        // choice rides every round's request body.
-        let thought_effort = {
+        // Session-scoped overrides ride every round's request body:
+        // thought level (issue #13) and the model pick (issue #40) —
+        // both chosen by the Client through set_config_option.
+        let (model_override, thought_effort) = {
             let sessions = state.sessions_read();
             sessions
                 .get(session_id)
-                .and_then(|s| s.thought_level.clone())
+                .map(|s| (s.model_override.clone(), s.thought_level.clone()))
+                .unwrap_or((None, None))
         };
         for attempt in 0..2 {
             // The receiver is loop-local: once the round's stream ends
@@ -985,7 +1021,7 @@ pub async fn session_prompt(
             let (mut rx, round_err) = match llm::chat_streamed(
                 &state.config,
                 &messages,
-                None,
+                model_override.as_deref(),
                 Some(&tool_defs),
                 thought_effort.as_deref(),
             )
@@ -1506,6 +1542,8 @@ pub fn session_restore(
         // Pinned decision on #13: the effort choice is in-memory only —
         // a restored session resets to the config default.
         thought_level: None,
+        // Same policy for the model override (issue #40).
+        model_override: None,
     };
     state
         .sessions_write()
@@ -1787,6 +1825,7 @@ mod tests {
             session_idle_timeout_secs: 0,
             prompt_supports_image: supports_image,
             context_size: 32768,
+            available_models: Vec::new(),
             thought_levels: Vec::new(),
             request_overrides: serde_json::Map::new(),
             client: reqwest::Client::builder()
@@ -1857,6 +1896,68 @@ mod tests {
     }
 
     #[test]
+    fn model_option_advertises_backend_list() {
+        // Issue #40: the startup probe's list is advertised; the
+        // configured model stays first/default even when the probe
+        // omitted it; probe failure degrades to the single model.
+        let mut cfg = cfg_with_image(false);
+        cfg.model = "gemma4".into();
+        cfg.available_models = vec!["claude-x".into(), "gemma4".into(), "gpt-y".into()];
+        let state = AppState::new(cfg);
+
+        let option = model_config_option(&state, None);
+        assert_eq!(option["currentValue"], "gemma4");
+        let values: Vec<&str> = option["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(values, vec!["claude-x", "gemma4", "gpt-y"]);
+
+        // Session override reflected as currentValue.
+        let option = model_config_option(&state, Some("claude-x"));
+        assert_eq!(option["currentValue"], "claude-x");
+
+        // Probe failed → configured model only.
+        let mut cfg = cfg_with_image(false);
+        cfg.model = "gemma4".into();
+        cfg.available_models = Vec::new();
+        let state = AppState::new(cfg);
+        let option = model_config_option(&state, None);
+        assert_eq!(option["options"].as_array().unwrap().len(), 1);
+        assert_eq!(option["options"][0]["value"], "gemma4");
+    }
+
+    #[test]
+    fn model_option_works_without_thought_levels() {
+        // Issue #40: model switching is zero-config — the option must
+        // be advertised even when thought_levels is empty.
+        let cfg = cfg_with_image(false);
+        let state = AppState::new(cfg);
+        state.sessions_write().insert(
+            "s1".into(),
+            Session::new(
+                json!({"role": "system", "content": "x"}),
+                "/tmp".into(),
+                ProtocolVersion::V1,
+            ),
+        );
+        let body = session_new_response(&state, "s1");
+        assert_eq!(body["configOptions"][0]["id"], "model");
+        assert_eq!(body["configOptions"].as_array().unwrap().len(), 1);
+
+        // …and set_config_option on "model" is accepted without
+        // thought_levels configured.
+        let updated = session_set_config_option(&state, "s1", "model", &json!("m")).unwrap();
+        assert_eq!(updated["configOptions"][0]["currentValue"], "m");
+        assert_eq!(
+            state.sessions_read().get("s1").unwrap().model_override,
+            Some("m".to_string())
+        );
+    }
+
+    #[test]
     fn set_config_option_validates_and_stores() {
         let mut cfg = cfg_with_image(false);
         cfg.thought_levels = vec!["low".into(), "high".into(), "max".into()];
@@ -1899,10 +2000,8 @@ mod tests {
         // …but a model we never offered is rejected.
         let err =
             session_set_config_option(&state, "s1", "model", &json!("other-model")).unwrap_err();
-        assert!(err.to_string().contains("not offered"), "got: {err}");
-
-        // Valid thought level → stored, response carries the updated
-        // option (index 1: the model option is first).
+        assert!(err.to_string().contains("not offered"), "got: {err}"); // Valid thought level → stored, response carries the updated
+                                                                        // option (index 1: the model option is first).
         let updated =
             session_set_config_option(&state, "s1", "thought_level", &json!("max")).unwrap();
         assert_eq!(updated["configOptions"][1]["currentValue"], "max");

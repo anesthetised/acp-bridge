@@ -319,6 +319,7 @@ mod tests {
 
     fn dummy_config(base_url: &str) -> LlmConfig {
         LlmConfig {
+            available_models: Vec::new(),
             base_url: base_url.to_string(),
             model: "m".into(),
             api_key: "k".into(),

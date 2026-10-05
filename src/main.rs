@@ -125,8 +125,18 @@ async fn main() {
         info!("{line}");
     }
 
-    // Probe backend
-    probe_backend(&config).await;
+    // Probe backend and capture the model list (issue #40): the
+    // startup probe's result feeds the `model` config option so
+    // Clients can switch models per session.
+    let mut config = config;
+    config.available_models = {
+        let mut list = probe_backend(&config).await;
+        // The configured model is always offered and stays the default.
+        if !list.iter().any(|m| m == &config.model) {
+            list.insert(0, config.model.clone());
+        }
+        list
+    };
 
     // Build shared state
     // Session persistence (issue #17): SQLite store unless disabled via
@@ -215,10 +225,11 @@ async fn main() {
 // Backend probing (shared by both modes)
 // ---------------------------------------------------------------------------
 
-async fn probe_backend(config: &llm::LlmConfig) {
-    match llm::probe_backend(config).await {
+async fn probe_backend(config: &llm::LlmConfig) -> Vec<String> {
+    let available = match llm::probe_backend(config).await {
         Ok(models) if models.is_empty() => {
             info!("Connected to backend (no models listed)");
+            Vec::new()
         }
         Ok(models) => {
             info!(count = models.len(), "Available models:");
@@ -231,6 +242,7 @@ async fn probe_backend(config: &llm::LlmConfig) {
             }) {
                 warn!(configured = %config.model, "Configured model not found in available models");
             }
+            models
         }
         Err(reason) => {
             warn!(
@@ -238,8 +250,9 @@ async fn probe_backend(config: &llm::LlmConfig) {
                 error = %reason,
                 "Cannot reach backend — will retry on first request"
             );
+            Vec::new()
         }
-    }
+    };
 
     // Query model info (Ollama native only)
     if let Some(info) = llm::query_model_info(config).await {
@@ -264,6 +277,8 @@ async fn probe_backend(config: &llm::LlmConfig) {
             }
         }
     }
+
+    available
 }
 
 // ---------------------------------------------------------------------------
