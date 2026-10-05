@@ -274,13 +274,19 @@ session's requests to it. No configuration needed; the configured
 model stays the default and is always offered even if the probe
 failed.
 
-It also advertises a `thought_level` option when levels are
-configured. bb's reasoning pipeline needs both — it probes reasoning
-by sending `session/set_config_option` with `configId: "model"` per
-model and reading the level back. When the user switches levels, bb
-sends `session/set_config_option` and every subsequent round's
-request body carries `reasoning_effort: <level>` — overriding any
-`[llm.request_overrides]` default for that session only.
+It also advertises a `thought_level` option — **by default**
+`low / medium / high / max` on OpenAI-compatible backends (Ollama
+native: none, it has no `reasoning_effort` parameter), or exactly
+your `[llm] thought_levels` list when configured. bb's reasoning
+pipeline probes reasoning by sending `session/set_config_option`
+with `configId: "model"` per model and reading the level back.
+When the user switches levels, bb sends `session/set_config_option`
+and every subsequent round's request body carries
+`reasoning_effort: <level>` — overriding any
+`[llm.request_overrides]` default for that session only. bb renders
+only its known level names (`none, minimal, low, medium, high,
+xhigh, ultracode, max, ultra`); anything else is dropped from the
+picker.
 
 ## Mac quick start (Apple Silicon)
 

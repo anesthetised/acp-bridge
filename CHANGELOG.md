@@ -37,6 +37,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   failure degrades to the single configured model. The choice is
   in-memory per session.
 
+- **Thought-level picker on by default** — when `[llm] thought_levels`
+  is not configured, OpenAI-compatible backends now advertise
+  `["low", "medium", "high", "max"]` automatically (Ollama-native:
+  none — it has no `reasoning_effort` parameter), so bb's
+  reasoning-effort picker works with zero configuration. Explicit
+  config still overrides, and `thought_levels = []` (or an empty
+  `LLM_THOUGHT_LEVELS`) forces the picker off.
+
 - **Per-config session store isolation** — the default database
   filename now derives from the config file stem
   (`cometapi.toml` → `sessions-cometapi.db`), so multiple agent

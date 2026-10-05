@@ -1827,6 +1827,7 @@ mod tests {
             context_size: 32768,
             available_models: Vec::new(),
             thought_levels: Vec::new(),
+            thought_levels_set: false,
             request_overrides: serde_json::Map::new(),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))

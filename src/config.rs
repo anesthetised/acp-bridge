@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::path::Path;
 use tracing::{info, warn};
 
-use crate::llm::LlmConfig;
+use crate::llm::{Backend, LlmConfig};
 use reqwest::Client;
 use serde_json::Value;
 use std::time::Duration;
@@ -157,17 +157,43 @@ impl ConfigFile {
             .or(file.model_context)
             .unwrap_or(32768);
 
-        // Thought levels (issue #13): env wins over config file; empty
-        // = feature off (no picker advertised).
-        let thought_levels = std::env::var("LLM_THOUGHT_LEVELS")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or(file.thought_levels.unwrap_or_default());
+        // Thought levels (issue #13): env wins over config file. When
+        // neither is set, apply the safe default — low/medium/high/max
+        // for OpenAI-compatible backends, none for Ollama-native (no
+        // reasoning_effort parameter there). An explicit empty list
+        // (`thought_levels = []` or `LLM_THOUGHT_LEVELS=""`) forces
+        // the picker off. Env counts as "set" even when it parses to
+        // an empty list (an empty env var is a deliberate off).
+        let (thought_levels, thought_levels_set) =
+            if let Ok(v) = std::env::var("LLM_THOUGHT_LEVELS") {
+                (
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>(),
+                    true,
+                )
+            } else {
+                match file.thought_levels {
+                    Some(levels) => (levels, true),
+                    None => {
+                        let backend = Backend::from_url(&base_url);
+                        if backend.is_ollama_native() {
+                            (Vec::new(), false)
+                        } else {
+                            (
+                                vec![
+                                    "low".to_string(),
+                                    "medium".to_string(),
+                                    "high".to_string(),
+                                    "max".to_string(),
+                                ],
+                                false,
+                            )
+                        }
+                    }
+                }
+            };
 
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
@@ -190,6 +216,7 @@ impl ConfigFile {
             prompt_supports_image,
             context_size,
             thought_levels,
+            thought_levels_set,
             // Issue #40: filled in by main after the startup probe.
             available_models: Vec::new(),
             // Issue #2: request overrides are config-only (structural
@@ -215,6 +242,82 @@ mod tests {
 
     fn env_guard() -> MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn thought_levels_safe_default_when_unset() {
+        let _env = env_guard();
+        std::env::remove_var("LLM_THOUGHT_LEVELS");
+
+        // Default base_url is OpenAI-compatible → safe four.
+        let llm = ConfigFile::default().into_llm_config();
+        assert_eq!(llm.thought_levels, vec!["low", "medium", "high", "max"]);
+        assert!(!llm.thought_levels_set);
+
+        // Ollama-native (no /v1) → none: no reasoning_effort there.
+        let cfg = ConfigFile::default();
+        let llm = ConfigFile {
+            llm: LlmSection {
+                base_url: Some("http://localhost:11434".into()),
+                ..cfg.llm
+            },
+        }
+        .into_llm_config();
+        assert!(llm.thought_levels.is_empty());
+        assert!(!llm.thought_levels_set);
+    }
+
+    #[test]
+    fn thought_levels_explicit_empty_forces_off() {
+        let _env = env_guard();
+        std::env::remove_var("LLM_THOUGHT_LEVELS");
+
+        // `thought_levels = []` in TOML → off even on OpenAI-compatible.
+        let llm = ConfigFile {
+            llm: LlmSection {
+                thought_levels: Some(Vec::new()),
+                ..Default::default()
+            },
+        }
+        .into_llm_config();
+        assert!(llm.thought_levels.is_empty());
+        assert!(llm.thought_levels_set);
+
+        // `LLM_THOUGHT_LEVELS=""` → off too (deliberate empty).
+        std::env::set_var("LLM_THOUGHT_LEVELS", "");
+        let llm = ConfigFile::default().into_llm_config();
+        assert!(llm.thought_levels.is_empty());
+        assert!(llm.thought_levels_set);
+        std::env::remove_var("LLM_THOUGHT_LEVELS");
+    }
+
+    #[test]
+    fn thought_levels_env_and_config_override_default() {
+        let _env = env_guard();
+
+        // Config file wins over the default...
+        std::env::remove_var("LLM_THOUGHT_LEVELS");
+        let llm = ConfigFile {
+            llm: LlmSection {
+                thought_levels: Some(vec!["none".into(), "xhigh".into()]),
+                ..Default::default()
+            },
+        }
+        .into_llm_config();
+        assert_eq!(llm.thought_levels, vec!["none", "xhigh"]);
+        assert!(llm.thought_levels_set);
+
+        // ...and env wins over the config file.
+        std::env::set_var("LLM_THOUGHT_LEVELS", "minimal,ultra");
+        let llm = ConfigFile {
+            llm: LlmSection {
+                thought_levels: Some(vec!["none".into(), "xhigh".into()]),
+                ..Default::default()
+            },
+        }
+        .into_llm_config();
+        assert_eq!(llm.thought_levels, vec!["minimal", "ultra"]);
+        std::env::remove_var("LLM_THOUGHT_LEVELS");
     }
 
     #[test]
