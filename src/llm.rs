@@ -353,6 +353,15 @@ pub struct LlmConfig {
     /// still display the percentage used.
     /// Override via `LLM_MODEL_CONTEXT` env var; defaults to 32768.
     pub context_size: u64,
+    /// Opt-in reasoning-effort levels advertised to ACP Clients as a
+    /// `thought_level` config option (issue #13, re-scoped to bb's
+    /// `configOptions` surface). Empty = feature off (no picker, no
+    /// wire change). Each level maps to a top-level `reasoning_effort`
+    /// field in upstream request bodies via `session/set_config_option`
+    /// (bb's picker sends `none|low|medium|high|xhigh|ultracode|max|ultra`).
+    /// Config: `[llm] thought_levels = [...]`; env: `LLM_THOUGHT_LEVELS`
+    /// (comma-separated; env wins over config).
+    pub thought_levels: Vec<String>,
     /// Arbitrary passthrough fields merged into the TOP LEVEL of every
     /// upstream request body after `build_body()` finishes (issue #2).
     /// Applied last — overrides win over built-in sampling fields
@@ -447,6 +456,15 @@ impl LlmConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32768),
+            thought_levels: std::env::var("LLM_THOUGHT_LEVELS")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
             request_overrides: serde_json::Map::new(),
             client,
         }
@@ -754,6 +772,10 @@ fn build_body(
     model: &str,
     stream: bool,
     tools: Option<&[Value]>,
+    // Session-scoped `reasoning_effort` (issue #13) — applied after
+    // request_overrides so the per-session choice wins. `None` when
+    // the Client never picked a thought level.
+    thought_effort: Option<&str>,
 ) -> Value {
     let mut body = json!({
         "model": model,
@@ -808,6 +830,14 @@ fn build_body(
         }
         body[key.as_str()] = value.clone();
     }
+    // Session thought level (issue #13): a Client-selected
+    // `reasoning_effort` (bb's thought-level picker) beats the global
+    // request_overrides default — the per-session choice is the most
+    // specific intent. build_body doesn't know the session, so the
+    // engine applies this after the merge via `thought_effort`.
+    if let Some(effort) = thought_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
     body
 }
 
@@ -817,10 +847,12 @@ pub async fn chat(
     messages: &[Value],
     model_override: Option<&str>,
     tools: Option<&[Value]>,
+    // Session thought level (issue #13) — `None` for bench/tests.
+    thought_effort: Option<&str>,
 ) -> Result<Value, LlmError> {
     let url = config.chat_url();
     let model = model_override.unwrap_or(&config.model);
-    let body = build_body(config, messages, model, false, tools);
+    let body = build_body(config, messages, model, false, tools, thought_effort);
     let response = send_with_retry(config, &url, &body, "chat").await?;
     response.json().await.map_err(|e| LlmError {
         kind: LlmErrorKind::ParseError,
@@ -835,7 +867,7 @@ pub async fn stream_chat(
     messages: &[Value],
     model_override: Option<&str>,
 ) -> Result<mpsc::Receiver<StreamChunk>, LlmError> {
-    stream_chat_with_tools(config, messages, model_override, None).await
+    stream_chat_with_tools(config, messages, model_override, None, None).await
 }
 
 /// Stream a chat completion with optional tool definitions.
@@ -862,12 +894,14 @@ pub async fn stream_chat_with_tools(
     messages: &[Value],
     model_override: Option<&str>,
     tools: Option<&[Value]>,
+    // Session thought level (issue #13) — `None` for bench/tests.
+    thought_effort: Option<&str>,
 ) -> Result<mpsc::Receiver<StreamChunk>, LlmError> {
     let url = config.chat_url();
     let model = model_override.unwrap_or(&config.model);
     let is_native = config.is_ollama_native();
 
-    let body = build_body(config, messages, model, true, tools);
+    let body = build_body(config, messages, model, true, tools, thought_effort);
     let response = send_with_retry(config, &url, &body, "stream_chat").await?;
 
     let (tx, rx) = mpsc::channel(256);
@@ -936,15 +970,17 @@ pub async fn chat_streamed(
     messages: &[Value],
     model_override: Option<&str>,
     tools: Option<&[Value]>,
+    // Session thought level (issue #13) — `None` for bench/tests.
+    thought_effort: Option<&str>,
 ) -> Result<mpsc::Receiver<StreamChunk>, LlmError> {
-    match stream_chat_with_tools(config, messages, model_override, tools).await {
+    match stream_chat_with_tools(config, messages, model_override, tools, thought_effort).await {
         Ok(rx) => Ok(rx),
         Err(setup_err) => {
             info!(
                 kind = setup_err.kind.as_str(),
                 "Streaming request failed at setup; falling back to non-streaming chat"
             );
-            let response = chat(config, messages, model_override, tools).await?;
+            let response = chat(config, messages, model_override, tools, thought_effort).await?;
             let (tx, rx) = mpsc::channel(256);
             let backend = config.backend();
             tokio::spawn(async move {
@@ -1383,6 +1419,7 @@ mod tests {
             session_idle_timeout_secs: 0,
             prompt_supports_image: false,
             context_size: 32768,
+            thought_levels: Vec::new(),
             request_overrides: serde_json::Map::new(),
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
@@ -1470,7 +1507,7 @@ mod tests {
     fn build_body_includes_core_fields_only_by_default() {
         let cfg = test_config("http://host/v1");
         let messages = vec![json!({"role": "user", "content": "hi"})];
-        let body = build_body(&cfg, &messages, "m", true, None);
+        let body = build_body(&cfg, &messages, "m", true, None, None);
         assert_eq!(body["model"], "m");
         assert_eq!(body["stream"], true);
         assert_eq!(body["messages"], json!(messages));
@@ -1483,15 +1520,15 @@ mod tests {
     fn build_body_clamps_temperature() {
         let mut cfg = test_config("http://host/v1");
         cfg.temperature = Some(5.0);
-        let hi = build_body(&cfg, &[], "m", false, None);
+        let hi = build_body(&cfg, &[], "m", false, None, None);
         assert_eq!(hi["temperature"], json!(2.0));
 
         cfg.temperature = Some(-1.0);
-        let lo = build_body(&cfg, &[], "m", false, None);
+        let lo = build_body(&cfg, &[], "m", false, None, None);
         assert_eq!(lo["temperature"], json!(0.0));
 
         cfg.temperature = Some(0.7);
-        let ok = build_body(&cfg, &[], "m", false, None);
+        let ok = build_body(&cfg, &[], "m", false, None, None);
         assert_eq!(ok["temperature"], json!(0.7));
     }
 
@@ -1500,7 +1537,7 @@ mod tests {
         let mut cfg = test_config("http://host/v1");
         cfg.max_tokens = Some(256);
         let tools = vec![json!({"type": "function", "function": {"name": "read"}})];
-        let body = build_body(&cfg, &[], "m", false, Some(&tools));
+        let body = build_body(&cfg, &[], "m", false, Some(&tools), None);
         assert_eq!(body["max_tokens"], json!(256));
         assert_eq!(body["tools"], json!(tools));
     }
@@ -1637,13 +1674,13 @@ mod tests {
         cfg.request_overrides
             .insert("reasoning_effort".into(), json!("max"));
         cfg.request_overrides.insert("top_p".into(), json!(0.95));
-        let body = build_body(&cfg, &[], "m", false, None);
+        let body = build_body(&cfg, &[], "m", false, None, None);
         assert_eq!(body["reasoning_effort"], "max");
         assert_eq!(body["top_p"], json!(0.95));
         // Nested objects/bools serialize fine.
         cfg.request_overrides
             .insert("extra".into(), json!({"nested": true, "n": 3}));
-        let body = build_body(&cfg, &[], "m", false, None);
+        let body = build_body(&cfg, &[], "m", false, None, None);
         assert_eq!(body["extra"], json!({"nested": true, "n": 3}));
     }
 
@@ -1657,7 +1694,7 @@ mod tests {
             .insert("temperature".into(), json!(1.0));
         cfg.request_overrides
             .insert("max_tokens".into(), json!(4096));
-        let body = build_body(&cfg, &[], "m", false, None);
+        let body = build_body(&cfg, &[], "m", false, None, None);
         assert_eq!(body["temperature"], json!(1.0));
         assert_eq!(body["max_tokens"], json!(4096));
     }
@@ -1677,6 +1714,7 @@ mod tests {
             "real-model",
             false,
             None,
+            None,
         );
         assert_eq!(body["model"], "real-model");
         assert_eq!(body["stream"], false);
@@ -1691,13 +1729,13 @@ mod tests {
         let mut cfg = test_config("http://host:11434");
         cfg.temperature = Some(0.4);
         cfg.request_overrides.insert("top_p".into(), json!(0.95));
-        let body = build_body(&cfg, &[], "m", false, None);
+        let body = build_body(&cfg, &[], "m", false, None, None);
         assert_eq!(body["options"]["temperature"], json!(0.4));
         assert_eq!(body["top_p"], json!(0.95));
 
         cfg.request_overrides
             .insert("options".into(), json!({"num_predict": 10}));
-        let body = build_body(&cfg, &[], "m", false, None);
+        let body = build_body(&cfg, &[], "m", false, None, None);
         // Override replaced the whole options object — documented shape.
         assert_eq!(body["options"], json!({"num_predict": 10}));
     }
@@ -1707,7 +1745,7 @@ mod tests {
         let mut cfg = test_config("http://host/v1");
         cfg.request_overrides.insert("x".into(), json!(1));
         cfg.request_overrides.clear();
-        let body = build_body(&cfg, &[], "m", false, None);
+        let body = build_body(&cfg, &[], "m", false, None, None);
         assert_eq!(body["model"], "m");
         assert_eq!(body.as_object().unwrap().len(), 3); // model, messages, stream
     }
@@ -2070,7 +2108,7 @@ mod tests {
         }
         let url = serve(Router::new().route("/v1/chat/completions", post(ok))).await;
         let cfg = test_config(&format!("{url}/v1"));
-        let val = chat(&cfg, &[], None, None).await.unwrap();
+        let val = chat(&cfg, &[], None, None, None).await.unwrap();
         assert_eq!(val["choices"][0]["message"]["content"], "hi");
     }
 
@@ -2091,7 +2129,7 @@ mod tests {
             .with_state(counter.clone());
         let url = serve(router).await;
         let cfg = test_config(&format!("{url}/v1"));
-        let val = chat(&cfg, &[], None, None).await.unwrap();
+        let val = chat(&cfg, &[], None, None, None).await.unwrap();
         assert_eq!(val["choices"][0]["message"]["content"], "ok");
         assert_eq!(counter.load(Ordering::SeqCst), 2, "should retry once");
     }
@@ -2103,7 +2141,7 @@ mod tests {
         }
         let url = serve(Router::new().route("/v1/chat/completions", post(bad))).await;
         let cfg = test_config(&format!("{url}/v1"));
-        let err = chat(&cfg, &[], None, None).await.unwrap_err();
+        let err = chat(&cfg, &[], None, None, None).await.unwrap_err();
         assert_eq!(
             err.kind,
             crate::llm::LlmErrorKind::BadRequest,

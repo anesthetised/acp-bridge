@@ -93,6 +93,13 @@ pub struct Session {
     /// on it so a v2 Client gets v2-shaped notifications even if a v1
     /// Client later connects to the same process.
     pub protocol_version: ProtocolVersion,
+    /// Per-session reasoning-effort override (issue #13): set by
+    /// `session/set_config_option` (bb's thought-level picker), applied
+    /// to every round's request body as `reasoning_effort` — session
+    /// choice beats `[llm.request_overrides]`. In-memory only: resets
+    /// to the config default on `session/load` after a restart (pinned
+    /// decision on #13).
+    pub thought_level: Option<String>,
 }
 
 impl Session {
@@ -106,6 +113,7 @@ impl Session {
             last_active: Instant::now(),
             working_dir,
             protocol_version,
+            thought_level: None,
         }
     }
 
@@ -147,6 +155,9 @@ pub enum AcpError {
 
     #[error("Session limit reached (max: {max})")]
     SessionLimitReached { max: usize },
+
+    #[error("Invalid parameter: {field}")]
+    InvalidParam { field: String },
 }
 
 impl AcpError {
@@ -158,6 +169,7 @@ impl AcpError {
             AcpError::MethodNotFound { .. } => -32601, // Method not found
             AcpError::LlmError { .. } => -32003,       // Application error
             AcpError::SessionLimitReached { .. } => -32004, // Application error
+            AcpError::InvalidParam { .. } => -32602,   // Invalid params
         }
     }
 }

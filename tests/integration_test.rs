@@ -2967,6 +2967,136 @@ async fn test_usage_update_prefers_backend_reported_tokens() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #13: thought-level config options — bb's dynamic-config surface
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_thought_level_config_option_flow() {
+    // End-to-end: opt-in via env → session/new advertises configOptions
+    // → set_config_option switches the level → the NEXT round's request
+    // body carries reasoning_effort: <level> (mock asserts the body).
+    // The self-healing mock keeps requesting tools until the level
+    // appears, then answers with it.
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(|req: Request<Body>| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                let level = body["reasoning_effort"].as_str().unwrap_or("");
+                if level == "max" {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "LEVEL_MAX seen"},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                    .into_response()
+                } else {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_wait",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{\"path\": \".\"}"}
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+    let mut h =
+        TestHarness::start_with_router_and_env(router, &[("LLM_THOUGHT_LEVELS", "low,high,max")])
+            .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // session/new advertises BOTH options: the model option bb's
+    // pipeline builds the model list from, then the thought_level
+    // option its reasoning probe reads back.
+    let model_option = &resp["result"]["configOptions"][0];
+    assert_eq!(model_option["id"], "model");
+    assert_eq!(model_option["category"], "model");
+    let option = &resp["result"]["configOptions"][1];
+    assert_eq!(option["id"], "thought_level");
+    assert_eq!(option["category"], "thought_level");
+    assert_eq!(option["currentValue"], "low");
+    assert_eq!(option["options"][2]["value"], "max");
+
+    // bb's reasoning discovery probe (x8/discoverAcpNativeReasoningBy
+    // Model): sends set_config_option with configId "model" and reads
+    // the thought_level option back from the response. Must succeed —
+    // a rejection here is why the picker never appeared.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":9,"method":"session/set_config_option",
+        "params":{"sessionId":&sid,"configId":"model","value":"test-model"}
+    }));
+    let (_, probe_resp) = h.read_until_response(9);
+    assert_eq!(
+        probe_resp["result"]["configOptions"][0]["id"], "model",
+        "model probe must be accepted and echo configOptions, got: {probe_resp:?}"
+    );
+    assert_eq!(
+        probe_resp["result"]["configOptions"][1]["id"],
+        "thought_level"
+    );
+
+    // Original turn — starts without the level.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"work"}]}
+    }));
+
+    // Switch the level once the turn is in flight (tool_call visible).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        assert!(deadline > std::time::Instant::now(), "turn never started");
+        let msg = h.read_message();
+        if msg["params"]["update"]["sessionUpdate"] == "tool_call" {
+            break;
+        }
+    }
+    h.send(&json!({
+        "jsonrpc":"2.0","id":3,"method":"session/set_config_option",
+        "params":{"sessionId":&sid,"configId":"thought_level","value":"max"}
+    }));
+    // Notifications from the in-flight turn (tool_call_update, …) may
+    // arrive between the request and its response — seek the response.
+    let (_, set_resp) = h.read_until_response(3);
+    assert_eq!(
+        set_resp["result"]["configOptions"][1]["currentValue"], "max",
+        "set_config_option returns the updated option, got: {set_resp:?}"
+    );
+
+    // The original turn's final answer proves the next round's body
+    // carried reasoning_effort: "max".
+    let (_, turn_response) = h.read_until_response(2);
+    assert!(
+        turn_response["result"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("LEVEL_MAX"),
+        "model must see reasoning_effort: max, got: {turn_response:?}"
+    );
+
+    h.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // Issue #30: steering — mid-turn prompts injected at tool-round boundaries
 // ---------------------------------------------------------------------------
 

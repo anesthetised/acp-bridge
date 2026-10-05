@@ -77,7 +77,7 @@ pub async fn run(config: &LlmConfig, fixtures: &[Fixture]) -> Vec<RunResult> {
         json!({"role": "system", "content": "Respond with one word."}),
         json!({"role": "user", "content": "Say 'ready'."}),
     ];
-    let _ = llm::chat(config, &warmup_messages, None, None).await;
+    let _ = llm::chat(config, &warmup_messages, None, None, None).await;
 
     let mut results = Vec::with_capacity(fixtures.len());
     for fx in fixtures {
@@ -88,7 +88,7 @@ pub async fn run(config: &LlmConfig, fixtures: &[Fixture]) -> Vec<RunResult> {
         messages.push(json!({"role": "user", "content": fx.user_text}));
 
         let start = Instant::now();
-        let response = llm::chat(config, &messages, None, None).await;
+        let response = llm::chat(config, &messages, None, None, None).await;
         let wall_ms = start.elapsed().as_millis();
 
         match response {
@@ -333,6 +333,7 @@ mod tests {
             prompt_supports_image: false,
             context_size: 32768,
             request_overrides: serde_json::Map::new(),
+            thought_levels: Vec::new(),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
