@@ -740,6 +740,14 @@ async fn send_with_retry(
     operation: &str,
 ) -> Result<reqwest::Response, LlmError> {
     let mut last_err: Option<LlmError> = None;
+    // Issue #47: cometapi-class gateways intermittently reject
+    // byte-identical valid requests with 400 "internal MaaS component"
+    // (observed live: fail → success → fail → success within seconds,
+    // same session/prompt/effort). One immediate retry salvages those;
+    // a deterministic 400 still surfaces, one attempt later. Tracked
+    // separately from the retryable-kind loop: at most ONE extra try,
+    // no backoff, and a loud log line marking it as done.
+    let mut bad_request_retried = false;
 
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
@@ -768,6 +776,15 @@ async fn send_with_retry(
                         status = %status,
                         operation,
                         "Transient LLM error"
+                    );
+                    last_err = Some(err);
+                } else if err.kind == LlmErrorKind::BadRequest && !bad_request_retried {
+                    bad_request_retried = true;
+                    warn!(
+                        kind = err.kind.as_str(),
+                        status = %status,
+                        operation,
+                        "400 on a valid-shaped request — retrying once (upstream intermittent-rejection flake, issue #47)"
                     );
                     last_err = Some(err);
                 } else {
@@ -2260,6 +2277,69 @@ mod tests {
             "err was: {err}"
         );
         assert!(err.message.contains("400"), "err was: {err}");
+    }
+
+    // -- 400 retry (issue #47) ----------------------------------------------
+
+    #[tokio::test]
+    async fn bad_request_is_retried_once_then_succeeds() {
+        // Flaky-upstream pattern from #47: first call 400s, second
+        // identical call succeeds. The bridge must transparently
+        // salvage it — exactly one retry, then the normal response.
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_ref = std::sync::Arc::clone(&hits);
+        let url = serve(Router::new().route(
+            "/v1/chat/completions",
+            post(move |req: axum::extract::Request<Body>| async move {
+                let _ = req;
+                if hits_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "internal MaaS component",
+                    )
+                        .into_response()
+                } else {
+                    axum::Json(json!({
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "salvaged"}}
+                        ]
+                    }))
+                    .into_response()
+                }
+            }),
+        ))
+        .await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let val = chat(&cfg, &[], None, None, None).await.unwrap();
+        assert_eq!(
+            val["choices"][0]["message"]["content"], "salvaged",
+            "flaky 400 must be retried once and succeed"
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn bad_request_is_retried_only_once() {
+        // Deterministic 400: retried once, then surfaces — the client
+        // still sees BadRequest, and the upstream sees exactly 2 calls.
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_ref = std::sync::Arc::clone(&hits);
+        let url = serve(Router::new().route(
+            "/v1/chat/completions",
+            post(move |_: axum::extract::Request<Body>| async move {
+                hits_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (axum::http::StatusCode::BAD_REQUEST, "nope").into_response()
+            }),
+        ))
+        .await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let err = chat(&cfg, &[], None, None, None).await.unwrap_err();
+        assert_eq!(err.kind, crate::llm::LlmErrorKind::BadRequest);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly one retry, no more"
+        );
     }
 
     // -- streaming ----------------------------------------------------------
