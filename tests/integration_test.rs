@@ -157,18 +157,40 @@ struct TestHarness {
 }
 
 impl TestHarness {
-    async fn start(port: u16) -> Self {
-        Self::start_with_router(port, mock_llm_router()).await
+    async fn start() -> Self {
+        Self::start_with_router(mock_llm_router()).await
     }
 
-    async fn start_with_router(port: u16, app: Router) -> Self {
-        Self::start_with_router_and_env(port, app, &[]).await
+    async fn start_with_router(app: Router) -> Self {
+        Self::start_with_router_and_env(app, &[]).await
     }
 
-    async fn start_with_router_and_env(port: u16, app: Router, extra_env: &[(&str, &str)]) -> Self {
-        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-            .await
-            .unwrap();
+    async fn start_with_router_and_env(app: Router, extra_env: &[(&str, &str)]) -> Self {
+        // Bind an OS-assigned port and keep the listener alive — the old
+        // free_port()-then-rebind pattern had an AddrInUse race (hit in
+        // CI twice), which is impossible when the same listener is used.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_port = listener.local_addr().unwrap().port();
+        // Auto-wire the agent to the mock unless the caller overrides
+        // LLM_BASE_URL (e.g. dead-URL or protocol tests).
+        let mut env: Vec<(String, String)> = extra_env
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    v.replace("{mock_port}", &mock_port.to_string()),
+                )
+            })
+            .collect();
+        if !env.iter().any(|(k, _)| k == "LLM_BASE_URL") {
+            env.push((
+                "LLM_BASE_URL".into(),
+                format!("http://127.0.0.1:{mock_port}/v1"),
+            ));
+        }
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let extra_env: &[(&str, &str)] = &env_refs;
         let server_handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -179,7 +201,7 @@ impl TestHarness {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
+            .env("LLM_BASE_URL", format!("http://127.0.0.1:{mock_port}/v1"))
             .env("LLM_MODEL", "test-model")
             .env("LLM_API_KEY", "test-key")
             .env("LLM_TIMEOUT", "10")
@@ -287,8 +309,7 @@ fn free_port() -> u16 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_initialize() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
 
@@ -312,8 +333,7 @@ async fn test_initialize() {
 /// echoed back verbatim (not dropped), and a response must still be produced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_initialize_with_uuid_string_id() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     // Exact shape from the issue: UUID string ID.
     h.send(&json!({
@@ -339,8 +359,7 @@ async fn test_initialize_with_uuid_string_id() {
 /// `stopReason: "end_turn"` — all without any compatibility shim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_full_flow_string_id_session_update_and_stop_reason() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     // initialize with a UUID string id
     h.send(&json!({
@@ -409,8 +428,7 @@ fn read_until_response_id(h: &mut TestHarness, expected: &str) -> (Vec<Value>, V
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_session_new_and_end() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     h.send(&json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp/test"}}));
     let resp = h.read_line();
@@ -430,7 +448,6 @@ async fn test_session_new_and_end() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_session_prompt_streaming() {
-    let port = free_port();
     // Reasoning delta + streamed content: exercises the thinking path
     // and the answer path of the streaming loop.
     let router = Router::new()
@@ -464,12 +481,7 @@ async fn test_session_prompt_streaming() {
                     .into_response()
             }),
         );
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     // Create session
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
@@ -511,8 +523,7 @@ async fn test_session_prompt_streaming() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_unknown_method() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     h.send(&json!({"jsonrpc":"2.0","id":99,"method":"nonexistent/method","params":{}}));
     let resp = h.read_line();
@@ -524,8 +535,7 @@ async fn test_unknown_method() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_session_prompt_missing_session_id() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     h.send(&json!({
         "jsonrpc":"2.0","id":10,"method":"session/prompt",
@@ -539,8 +549,7 @@ async fn test_session_prompt_missing_session_id() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_session_prompt_unknown_session() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     h.send(&json!({
         "jsonrpc":"2.0","id":11,"method":"session/prompt",
@@ -554,8 +563,7 @@ async fn test_session_prompt_unknown_session() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_session_end_unknown_session() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     h.send(&json!({"jsonrpc":"2.0","id":12,"method":"session/end","params":{"sessionId":"nope"}}));
     let resp = h.read_line();
@@ -589,14 +597,7 @@ async fn test_thinking_text_surfaces_as_agent_thought_chunk() {
             }),
         )
         .route("/api/tags", get(mock_ollama_tags));
-
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -688,14 +689,7 @@ async fn test_streamed_round_emits_incremental_thought_and_answer_chunks() {
             }),
         )
         .route("/api/tags", get(mock_ollama_tags));
-
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -791,14 +785,7 @@ async fn test_streamed_tool_call_fragments_execute() {
             ),
         )
         .with_state(call_count);
-
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -860,14 +847,7 @@ async fn test_mid_stream_error_fails_turn_without_retry() {
                 }
             }),
         );
-
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -938,14 +918,7 @@ async fn test_streaming_unsupported_falls_back_to_non_streaming() {
                 }
             }),
         );
-
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -1048,14 +1021,7 @@ async fn test_tool_call_notifications_carry_specifics() {
                 }
             }),
         );
-
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -1149,8 +1115,7 @@ async fn test_tool_call_notifications_carry_specifics() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_session_end_missing_session_id() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     h.send(&json!({"jsonrpc":"2.0","id":13,"method":"session/end","params":{}}));
     let resp = h.read_line();
@@ -1161,8 +1126,7 @@ async fn test_session_end_missing_session_id() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_full_conversation_flow() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     // Initialize
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
@@ -1209,8 +1173,7 @@ async fn test_empty_prompt_rejected() {
     // user message to the LLM. Previous versions returned status:
     // "completed" with empty content, which surfaced as "the agent
     // doesn't respond" when upstream clients sent malformed payloads.
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -1228,8 +1191,7 @@ async fn test_empty_prompt_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_graceful_shutdown_on_stdin_close() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     drop(h.child.stdin.take());
     let status = h.child.wait().expect("Failed to wait for child");
@@ -1242,8 +1204,7 @@ async fn test_graceful_shutdown_on_stdin_close() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cwd_injection_sanitized() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     // Send a malicious cwd with prompt injection characters
     h.send(&json!({
@@ -1268,8 +1229,7 @@ async fn test_cwd_injection_sanitized() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cwd_normal_path_preserved() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     // Normal path should pass through sanitization unchanged
     h.send(&json!({
@@ -1289,8 +1249,7 @@ async fn test_cwd_normal_path_preserved() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_llm_error_returns_response() {
-    let port = free_port();
-    let mut h = TestHarness::start_with_router(port, mock_llm_error_router()).await;
+    let mut h = TestHarness::start_with_router(mock_llm_error_router()).await;
 
     // Create session
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
@@ -1327,8 +1286,7 @@ async fn test_llm_error_returns_response() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_sse_crlf_line_endings() {
-    let port = free_port();
-    let mut h = TestHarness::start_with_router(port, mock_llm_crlf_router()).await;
+    let mut h = TestHarness::start_with_router(mock_llm_crlf_router()).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -1363,13 +1321,9 @@ async fn test_sse_crlf_line_endings() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_max_sessions_limit() {
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        mock_llm_router(),
-        &[("LLM_MAX_SESSIONS", "2")],
-    )
-    .await;
+    let mut h =
+        TestHarness::start_with_router_and_env(mock_llm_router(), &[("LLM_MAX_SESSIONS", "2")])
+            .await;
 
     // Create session 1
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
@@ -1398,14 +1352,10 @@ async fn test_max_sessions_limit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_nan_temperature_ignored() {
-    let port = free_port();
     // NaN temperature should be filtered out (treated as None)
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        mock_llm_router(),
-        &[("LLM_TEMPERATURE", "nan")],
-    )
-    .await;
+    let mut h =
+        TestHarness::start_with_router_and_env(mock_llm_router(), &[("LLM_TEMPERATURE", "nan")])
+            .await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -1539,11 +1489,9 @@ async fn mock_ollama_ps() -> impl IntoResponse {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ollama_native_streaming() {
-    let port = free_port();
     let mut h = TestHarness::start_with_router_and_env(
-        port,
         mock_ollama_native_router(),
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}"))],
+        &[("LLM_BASE_URL", "http://127.0.0.1:{mock_port}")],
     )
     .await;
 
@@ -1579,11 +1527,9 @@ async fn test_ollama_native_streaming() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ollama_auto_detect_native() {
-    let port = free_port();
     let mut h = TestHarness::start_with_router_and_env(
-        port,
         mock_ollama_native_router(),
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}"))],
+        &[("LLM_BASE_URL", "http://127.0.0.1:{mock_port}")],
     )
     .await;
 
@@ -1599,13 +1545,7 @@ async fn test_ollama_auto_detect_native() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ollama_openai_compat_still_works() {
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        mock_llm_router(),
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(mock_llm_router()).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -1739,15 +1679,13 @@ async fn mock_chat_completions_always_tool() -> impl IntoResponse {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tool_round_limit_surfaces_failure() {
-    let port = free_port();
     // Pin the budget explicitly so the test exercises the env-var plumbing
     // (`LLM_MAX_TOOL_ROUNDS`) rather than the default, and so a future
     // default change cannot silently invalidate the round count below.
     let mut h = TestHarness::start_with_router_and_env(
-        port,
         mock_llm_always_tool_router(),
         &[
-            ("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1")),
+            ("LLM_BASE_URL", "http://127.0.0.1:{mock_port}/v1"),
             ("LLM_MAX_TOOL_ROUNDS", "5"),
         ],
     )
@@ -1795,15 +1733,13 @@ async fn test_tool_round_limit_surfaces_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tool_round_limit_configurable() {
-    let port = free_port();
     // A budget of 2 rounds must exhaust after exactly 2 tool-call rounds —
     // a default of 5 would need 5. Proves the value is honored, not just
     // reported.
     let mut h = TestHarness::start_with_router_and_env(
-        port,
         mock_llm_always_tool_router(),
         &[
-            ("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1")),
+            ("LLM_BASE_URL", "http://127.0.0.1:{mock_port}/v1"),
             ("LLM_MAX_TOOL_ROUNDS", "2"),
         ],
     )
@@ -1850,14 +1786,8 @@ async fn test_tool_round_limit_configurable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tool_call_list_dir() {
-    let port = free_port();
     // Use /tmp as working dir since it always exists
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        mock_llm_tool_call_router(),
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(mock_llm_tool_call_router()).await;
 
     // Create session with a real directory as cwd
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
@@ -2038,14 +1968,7 @@ async fn test_edit_completion_carries_diff_content_block() {
                 }
             }),
         );
-
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd": dir.to_str().unwrap()}}));
     let resp = h.read_line();
@@ -2149,14 +2072,7 @@ async fn test_write_file_new_file_diff_old_text_null() {
                 }
             }),
         );
-
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd": dir.to_str().unwrap()}}));
     let resp = h.read_line();
@@ -2211,9 +2127,7 @@ async fn test_write_file_new_file_diff_old_text_null() {
 async fn test_initialize_does_not_advertise_image_by_default() {
     // Ensure the opt-in env var is unset for this test
     std::env::remove_var("LLM_SUPPORTS_IMAGE");
-
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     h.send(&json!({
         "jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}
@@ -2233,10 +2147,9 @@ async fn test_initialize_does_not_advertise_image_by_default() {
 /// without it the per-tool timeline collapses and rendering degrades.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tool_call_notification_carries_tool_call_id_and_kind() {
-    let port = free_port();
     // A real tool round (list_dir) — tool_call notifications must carry
     // the ids and kinds of actual model-invoked tools.
-    let mut h = TestHarness::start_with_router(port, mock_llm_tool_call_router()).await;
+    let mut h = TestHarness::start_with_router(mock_llm_tool_call_router()).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -2322,7 +2235,6 @@ async fn test_tool_call_notification_carries_tool_call_id_and_kind() {
 /// as an empty bubble.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_thought_chunk_carries_content_block() {
-    let port = free_port();
     // Real reasoning delta from the streaming mock (not a synthetic
     // wrapper) — the thought chunk must carry a typed content block.
     let router = Router::new()
@@ -2352,12 +2264,7 @@ async fn test_thought_chunk_carries_content_block() {
                     .into_response()
             }),
         );
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -2698,13 +2605,9 @@ async fn test_session_load_replays_history_after_restart() {
 async fn test_persistence_opt_out_hides_capabilities() {
     // ACP_PERSISTENCE=off: loadSession is NOT advertised, and
     // session/load keeps the historical no_persistence rejection.
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        mock_llm_router(),
-        &[("ACP_PERSISTENCE", "off")],
-    )
-    .await;
+    let mut h =
+        TestHarness::start_with_router_and_env(mock_llm_router(), &[("ACP_PERSISTENCE", "off")])
+            .await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}));
     let init = h.read_line();
@@ -2927,8 +2830,7 @@ async fn test_session_cancel_aborts_turn_and_reports_cancelled() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cancel_without_turn_and_concurrent_prompt_guard() {
-    let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start().await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -2961,6 +2863,72 @@ async fn test_cancel_without_turn_and_concurrent_prompt_guard() {
     }));
     let (_, response) = h.read_until_response(3);
     assert_eq!(response["result"]["status"], "completed");
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_usage_update_prefers_backend_reported_tokens() {
+    // Issue #4: when the backend reports usage (final SSE chunk with a
+    // `usage` object), usage_update must carry the REAL token count —
+    // not the chars/4 estimate. The mock's content ("Hi" = 2 chars ≈ 0
+    // estimated tokens) guarantees the estimate and the reported number
+    // diverge.
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(|_req: Request<Body>| async move {
+                let chunks = vec![
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices": [{"delta": {"content": "Hi"}}]})
+                    ),
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices": [], "usage": {"prompt_tokens": 1234, "completion_tokens": 56}})
+                    ),
+                    "data: [DONE]\n\n".to_string(),
+                ];
+                let stream = futures_lite::stream::iter(
+                    chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+                );
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+                    .into_response()
+            }),
+        );
+    let mut h = TestHarness::start_with_router(router).await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hi"}]}
+    }));
+    let (notifications, _response) = h.read_until_response(2);
+
+    let usage = notifications
+        .iter()
+        .find(|m| m["params"]["update"]["sessionUpdate"] == "usage_update")
+        .map(|m| {
+            (
+                m["params"]["update"]["used"].as_u64(),
+                m["params"]["update"]["size"].as_u64(),
+            )
+        });
+    let (used, size) = usage.expect("usage_update notification after turn");
+    assert_eq!(
+        used,
+        Some(1290),
+        "used must be backend-reported prompt+completion"
+    );
+    assert_eq!(size, Some(32768), "size is the configured context window");
 
     h.shutdown();
 }
@@ -3028,14 +2996,7 @@ async fn test_steer_reaches_model_in_same_turn() {
                 }
             }),
         );
-
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -3119,14 +3080,7 @@ async fn test_steer_invalid_rejected_and_cancelled_steers_not_lost() {
                 .into_response()
             }),
         );
-
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -3230,14 +3184,7 @@ async fn test_truncated_stream_retries_silently_when_nothing_notified() {
                 }
             }),
         );
-
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -3291,14 +3238,7 @@ async fn test_truncated_stream_fails_when_chunks_already_notified() {
                 }
             }),
         );
-
-    let port = free_port();
-    let mut h = TestHarness::start_with_router_and_env(
-        port,
-        router,
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
-    )
-    .await;
+    let mut h = TestHarness::start_with_router(router).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
