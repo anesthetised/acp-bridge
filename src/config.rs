@@ -164,37 +164,36 @@ impl ConfigFile {
         // (`thought_levels = []` or `LLM_THOUGHT_LEVELS=""`) forces
         // the picker off. Env counts as "set" even when it parses to
         // an empty list (an empty env var is a deliberate off).
-        let (thought_levels, thought_levels_set) = if let Ok(v) =
-            std::env::var("LLM_THOUGHT_LEVELS")
-        {
-            (
-                v.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>(),
-                true,
-            )
-        } else {
-            match file.thought_levels {
-                Some(levels) => (levels, true),
-                None => {
-                    let backend = Backend::from_url(&base_url);
-                    if backend.is_ollama_native() {
-                        (Vec::new(), false)
-                    } else {
-                        (
-                            vec![
-                                "low".to_string(),
-                                "medium".to_string(),
-                                "high".to_string(),
-                                "max".to_string(),
-                            ],
-                            false,
-                        )
+        let (thought_levels, thought_levels_set) =
+            if let Ok(v) = std::env::var("LLM_THOUGHT_LEVELS") {
+                (
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>(),
+                    true,
+                )
+            } else {
+                match file.thought_levels {
+                    Some(levels) => (levels, true),
+                    None => {
+                        let backend = Backend::from_url(&base_url);
+                        if backend.is_ollama_native() {
+                            (Vec::new(), false)
+                        } else {
+                            (
+                                vec![
+                                    "low".to_string(),
+                                    "medium".to_string(),
+                                    "high".to_string(),
+                                    "max".to_string(),
+                                ],
+                                false,
+                            )
+                        }
                     }
                 }
-            }
-        };
+            };
 
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
@@ -252,10 +251,7 @@ mod tests {
 
         // Default base_url is OpenAI-compatible → safe four.
         let llm = ConfigFile::default().into_llm_config();
-        assert_eq!(
-            llm.thought_levels,
-            vec!["low", "medium", "high", "max"]
-        );
+        assert_eq!(llm.thought_levels, vec!["low", "medium", "high", "max"]);
         assert!(!llm.thought_levels_set);
 
         // Ollama-native (no /v1) → none: no reasoning_effort there.
