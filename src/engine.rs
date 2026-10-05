@@ -1015,6 +1015,16 @@ pub async fn session_prompt(
                 .map(|s| (s.model_override.clone(), s.thought_level.clone()))
                 .unwrap_or((None, None))
         };
+        // Live-verifiable record of the per-session overrides actually
+        // riding this round (issues #40/#43): at debug level, so the
+        // picker → request chain can be confirmed with
+        // RUST_LOG=acp_bridge=debug without touching the gateway.
+        debug!(
+            session_id = %session_id,
+            model = %model_override.as_ref().unwrap_or(&state.config.model),
+            reasoning_effort = ?thought_effort,
+            "round request overrides"
+        );
         for attempt in 0..2 {
             // The receiver is loop-local: once the round's stream ends
             // (normally or by error) it has no further use.
@@ -1129,6 +1139,7 @@ pub async fn session_prompt(
                 kind = e.kind.as_str(),
                 status = ?e.status,
                 retryable,
+                detail = %e.message,
                 "LLM communication failed"
             );
             break;

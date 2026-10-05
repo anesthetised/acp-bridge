@@ -726,6 +726,12 @@ async fn send_with_retry(
                     return Ok(response);
                 }
                 let snippet = response.text().await.unwrap_or_default();
+                // Full body at debug: the 200-char cap in LlmError is
+                // right for client-visible text but loses the details
+                // (request ids, upstream component names) needed to
+                // debug upstream 400s like cometapi's "internal MaaS
+                // component" rejections.
+                debug!(operation, status = %status, body = %snippet, "LLM error response body");
                 let err = LlmError::from_status(status, &snippet);
                 if err.kind.is_retryable() {
                     warn!(

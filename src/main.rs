@@ -73,15 +73,42 @@ async fn main() {
         RunMode::Acp
     };
 
-    // Initialize tracing — writes to stderr, respects RUST_LOG env.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "acp_bridge=info".parse().unwrap()),
-        )
-        .with_target(true)
-        .with_writer(std::io::stderr)
-        .init();
+    // Initialize tracing — stderr by default (stdout is the ACP wire),
+    // or an append-only log file when ACP_LOG_FILE is set. bb's host
+    // daemon swallows agent stderr (bridge INFO/DEBUG lines never reach
+    // ~/.bb logs), so under bb the per-round override lines (#40/#43)
+    // need a file the bridge owns. Zero config-file surface: one env var.
+    let default_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "acp_bridge=info".parse().unwrap());
+    match std::env::var("ACP_LOG_FILE") {
+        Ok(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap_or_else(|e| panic!("ACP_LOG_FILE '{path}' unwritable: {e}"));
+            tracing_subscriber::fmt()
+                .with_env_filter(default_filter)
+                .with_target(true)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+        }
+        Err(_) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(default_filter)
+                .with_target(true)
+                .with_writer(std::io::stderr)
+                .init();
+        }
+    }
+    // Binary identity (reports should be actionable): the git short
+    // hash stamped at build time, logged after tracing init so it
+    // lands in the ACP_LOG_FILE under stderr-swallowing hosts.
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        build_hash = env!("ACP_BUILD_HASH"),
+        "binary identity"
+    );
 
     // Load config: CLI arg (optional TOML path) → env vars → defaults
     let config_path = args.iter().skip(1).find(|a| !a.starts_with('-')).cloned();
@@ -830,6 +857,25 @@ async fn handle_acp_prompt(
         _ => "other",
     };
     debug!(prompt_kind, "session/prompt input shape");
+    // Selection-intent carrier (bb#4433 research): bb's composer may
+    // attach model/reasoning to the prompt request as fields. Log the
+    // full top-level key set plus any non-standard field values, so
+    // intent delivery is verifiable regardless of field naming.
+    if let Some(fields) = params.as_object() {
+        let mut keys: Vec<&String> = fields.keys().collect();
+        keys.sort();
+        let standard = ["sessionId", "prompt", "mcpServers", "_meta"];
+        let extras: serde_json::Map<String, Value> = fields
+            .iter()
+            .filter(|(k, _)| !standard.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        debug!(
+            keys = %keys.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","),
+            ?extras,
+            "session/prompt top-level fields"
+        );
+    }
 
     let raw_user_text = engine::extract_user_text_from_prompt(&prompt_value);
     let (user_text, sender_context) = engine::strip_sender_context(&raw_user_text);
