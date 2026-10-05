@@ -25,6 +25,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Per-session thought levels via `session/set_config_option`** —
+  opt-in (`[llm] thought_levels = ["low", "high", "max"]` or
+  `LLM_THOUGHT_LEVELS` env): `session/new` advertises a `thought_level`
+  config option, and Clients that speak bb's dynamic-config surface
+  render a reasoning-effort picker. Selecting a level sends
+  `session/set_config_option`, which stores a per-session override
+  applied to every subsequent round's request body as
+  `reasoning_effort` — session choice beats `[llm.request_overrides]`
+  defaults (issue #13's goal, implemented on bb's wire surface after
+  the probe showed bb does not implement ACP standard modes). Invalid
+  values are refused with `-32602` naming the advertised levels; the
+  choice is in-memory (a restored session resets to the config
+  default). Without config, the feature is invisible and the wire is
+  unchanged.
+
 - **Backend-reported usage numbers in `usage_update`** — the engine now
   prefers the backend's own token counts over the chars/4 estimate
   (issue #4): OpenAI-compatible responses' `usage` object (streaming

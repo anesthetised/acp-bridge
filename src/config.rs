@@ -52,6 +52,11 @@ pub struct LlmSection {
     /// structural config, not a secret.
     #[serde(default)]
     pub request_overrides: Option<serde_json::Map<String, Value>>,
+    /// Reasoning-effort levels advertised to Clients as a
+    /// `thought_level` config option (issue #13). Empty = off. The env
+    /// var `LLM_THOUGHT_LEVELS` (comma-separated) takes precedence.
+    #[serde(default)]
+    pub thought_levels: Option<Vec<String>>,
 }
 
 impl ConfigFile {
@@ -152,6 +157,18 @@ impl ConfigFile {
             .or(file.model_context)
             .unwrap_or(32768);
 
+        // Thought levels (issue #13): env wins over config file; empty
+        // = feature off (no picker advertised).
+        let thought_levels = std::env::var("LLM_THOUGHT_LEVELS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or(file.thought_levels.unwrap_or_default());
+
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(4)
@@ -172,6 +189,7 @@ impl ConfigFile {
             session_idle_timeout_secs,
             prompt_supports_image,
             context_size,
+            thought_levels,
             // Issue #2: request overrides are config-only (structural
             // passthrough, not a secret) — no env var by design.
             request_overrides: file.request_overrides.unwrap_or_default(),

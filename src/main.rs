@@ -407,7 +407,10 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                             raw_cwd,
                                             state.protocol_version,
                                         );
-                                        acp::send_response(&id, json!({"sessionId": session_id}));
+                                        acp::send_response(
+                                            &id,
+                                            engine::session_new_response(&state, &session_id),
+                                        );
                                     }
                                     Err(e) => {
                                         acp::send_error(&id, e.code(), &e.to_string());
@@ -496,6 +499,31 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                     )
                                     .await;
                                 });
+                            }
+                            "session/set_config_option" => {
+                                // Issue #13 (bb's dynamic-config surface):
+                                // the Client picks a thought level from the
+                                // `configOptions` advertised at `session/new`;
+                                // the choice applies to this session's
+                                // subsequent rounds.
+                                let session_id =
+                                    params.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+                                let config_id =
+                                    params.get("configId").and_then(|v| v.as_str()).unwrap_or("");
+                                let value = params.get("value").cloned().unwrap_or(Value::Null);
+                                if session_id.is_empty() || config_id.is_empty() {
+                                    let err = AcpError::MissingParam {
+                                        field: "sessionId, configId".into(),
+                                    };
+                                    acp::send_error(&id, err.code(), &err.to_string());
+                                } else {
+                                    match engine::session_set_config_option(
+                                        &state, session_id, config_id, &value,
+                                    ) {
+                                        Ok(updated) => acp::send_response(&id, updated),
+                                        Err(e) => acp::send_error(&id, e.code(), &e.to_string()),
+                                    }
+                                }
                             }
                             "session/end" | "session/close" => {
                                 let session_id = params.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
