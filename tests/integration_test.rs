@@ -2359,6 +2359,39 @@ async fn test_sigterm_exits_gracefully() {
     }
 
     let pid = child.id() as libc::c_int;
+
+    // Deterministic liveness proof (found flaky in CI: the banner
+    // appears *before* the main select loop runs, so an immediate
+    // SIGTERM could land in the un-registered window and kill the child
+    // with the default disposition). Round-trip an `initialize` request:
+    // a response can only be produced from inside the select loop, and
+    // `select!` polls every branch on entry — so a response guarantees
+    // the SIGTERM handler is registered.
+    let mut stdout_reader = BufReader::new(child.stdout.take().expect("stdout"));
+    writeln!(
+        child.stdin.as_mut().expect("stdin"),
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+    )
+    .expect("write initialize");
+    let init_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut initialized = false;
+    while std::time::Instant::now() < init_deadline {
+        let mut line = String::new();
+        match stdout_reader.read_line(&mut line) {
+            Ok(0) => panic!("agent stdout closed before initialize response"),
+            Ok(_) => {
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if msg.get("id") == Some(&serde_json::json!(1)) && msg.get("result").is_some() {
+                        initialized = true;
+                        break;
+                    }
+                }
+            }
+            Err(e) => panic!("read initialize response: {e}"),
+        }
+    }
+    assert!(initialized, "agent never answered initialize within 10s");
+
     // SAFETY: sending SIGTERM to our own child process.
     unsafe {
         libc::kill(pid, libc::SIGTERM);
