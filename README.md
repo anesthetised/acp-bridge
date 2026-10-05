@@ -368,7 +368,7 @@ the matching wire shape from the same code base.
 |--------|--------|
 | `initialize` | Supported. v1: emits `agentCapabilities` + `agentInfo`. v2: emits unified `capabilities` + `info`. Image capability opt-in via `LLM_SUPPORTS_IMAGE`. |
 | `session/new` | Multi-session with per-session conversation history. `mcpServers` param accepted but ignored (acp-bridge has no MCP relay). |
-| `session/prompt` | Streaming via SSE → `session/update` notifications. Text and `ContentBlock::ResourceLink` always supported; `ContentBlock::Image` only when `LLM_SUPPORTS_IMAGE=true`. Final response shape is version-aware (v1: `{stopReason, status, text}`; v2: `{messageId}` with `stopReason` on `state_update`). |
+| `session/prompt` | Streaming via SSE → `session/update` notifications. Text and `ContentBlock::ResourceLink` always supported; `ContentBlock::Image` only when `LLM_SUPPORTS_IMAGE=true`. Final response shape is version-aware (v1: `{stopReason, status, text}`; v2: `{messageId}` with `stopReason` on `state_update`). Mid-turn prompts (steering) are queued and injected at the next tool-round boundary; acked on injection, explicit "not delivered" error if the turn ends/cancels first |
 | `session/cancel` notification | Acknowledged with a log line. In-flight cancellation is on the roadmap. |
 | `session/end` (v1) / `session/close` (v2 baseline) | Session cleanup. Both methods share the same implementation. |
 | `session/list` (v2 baseline) | Returns active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}`. |

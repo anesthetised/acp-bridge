@@ -230,6 +230,15 @@ pub enum Notification {
         diff: Option<crate::tools::ToolDiff>,
     },
     TextChunk(String),
+    /// A queued steer (issue #30) was injected into session history at a
+    /// tool-round boundary — the model can now see it. The transport
+    /// must answer the held `session/prompt` request (`request_id`) at
+    /// this point: ack-on-injection means the Client's pending state
+    /// clears exactly when the content reached the model.
+    SteerAck {
+        request_id: crate::protocol::RequestId,
+        message_id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +270,28 @@ pub struct AppState {
     /// cancel handler flips; the turn's response task selects on it.
     /// Turns are keyed by session — a session runs at most one turn.
     pub turn_registry: Arc<std::sync::Mutex<HashMap<String, TurnEntry>>>,
+    /// Mid-turn Client prompts ("steering", issue #30). When a turn is
+    /// in flight, a second `session/prompt` is queued here instead of
+    /// being rejected: the engine injects the content as a real `user`
+    /// message at the next tool-round boundary — the model sees it
+    /// in-context — and only then is the steer's JSON-RPC request
+    /// answered (ack-on-injection: the Client's "pending" indicator
+    /// clears exactly when the model can see the content).
+    pub pending_steers: Arc<std::sync::Mutex<HashMap<String, Vec<SteerEntry>>>>,
+}
+
+/// A queued mid-turn prompt (issue #30). Carries everything needed to
+/// (a) append the content to session history on injection and (b)
+/// answer the held JSON-RPC request exactly once — on injection, or on
+/// turn end if the turn finished without an injection point.
+#[derive(Debug, Clone)]
+pub struct SteerEntry {
+    pub text: String,
+    pub images: Vec<ImageBlock>,
+    /// The held `session/prompt` JSON-RPC request id.
+    pub request_id: crate::protocol::RequestId,
+    /// Freshly minted messageId for the v2 ack response.
+    pub message_id: String,
 }
 
 /// One in-flight turn: generation counter + cancel flag (issue #3).
@@ -274,7 +305,28 @@ impl Clone for AppState {
             protocol_version: self.protocol_version,
             store: self.store.clone(),
             turn_registry: Arc::clone(&self.turn_registry),
+            pending_steers: Arc::clone(&self.pending_steers),
         }
+    }
+}
+
+impl AppState {
+    /// Queue a mid-turn prompt for injection at the next tool-round
+    /// boundary (issue #30). Returns the queue length after the push.
+    pub fn queue_steer(&self, session_id: &str, entry: SteerEntry) -> usize {
+        let mut map = self.pending_steers.lock().expect("pending_steers lock");
+        let queue = map.entry(session_id.to_string()).or_default();
+        queue.push(entry);
+        queue.len()
+    }
+
+    /// Drain all queued steers for a session (issue #30). Called by the
+    /// engine at tool-round boundaries and by the transport at turn end
+    /// (to acknowledge anything the turn finished without injecting —
+    /// nothing queued may be silently dropped).
+    pub fn drain_steers(&self, session_id: &str) -> Vec<SteerEntry> {
+        let mut map = self.pending_steers.lock().expect("pending_steers lock");
+        map.remove(session_id).unwrap_or_default()
     }
 }
 
@@ -298,6 +350,7 @@ impl AppState {
             protocol_version: crate::protocol::ProtocolVersion::V1,
             store,
             turn_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pending_steers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -574,6 +627,46 @@ pub fn session_new_post_create_notifications(
 /// prompt. It is required on the v2 `PromptResponse` and used by v2
 /// Clients to correlate the response with `user_message` and
 /// `agent_message` session updates. v1 Clients ignore it.
+/// Steering (issue #30): drain queued mid-turn prompts and append them
+/// to session history as real `user` messages. Called at every
+/// tool-round boundary AND at the final-response guard — the model must
+/// see the steer before the turn may end. Each injected steer's held
+/// JSON-RPC request is acked here (ack-on-injection, pinned decision on
+/// #30): the Client's pending state clears exactly when the content is
+/// visible to the model. Returns the number of steers injected.
+fn inject_steers(
+    state: &Arc<AppState>,
+    session_id: &str,
+    round: usize,
+    notify: &impl Fn(Notification),
+) -> usize {
+    let steers = state.drain_steers(session_id);
+    let count = steers.len();
+    if count == 0 {
+        return 0;
+    }
+    {
+        let mut sessions = state.sessions_write();
+        if let Some(session) = sessions.get_mut(session_id) {
+            let backend = state.config.backend();
+            for steer in &steers {
+                session
+                    .messages
+                    .push(backend.format_user_message(&steer.text, &steer.images));
+            }
+        }
+    }
+    persist_session_snapshot(state, session_id);
+    for steer in steers {
+        info!(session_id, round, "Injecting queued steer");
+        notify(Notification::SteerAck {
+            request_id: steer.request_id,
+            message_id: steer.message_id,
+        });
+    }
+    count
+}
+
 pub async fn session_prompt(
     state: &Arc<AppState>,
     session_id: &str,
@@ -658,6 +751,16 @@ pub async fn session_prompt(
         if max_tool_rounds > 0 && round >= max_tool_rounds {
             break;
         }
+        // Steering (issue #30): drain queued mid-turn prompts at the
+        // round boundary and append them as real `user` messages, so
+        // the model addresses them in-context this round. Each injected
+        // steer's held JSON-RPC request is acked exactly here
+        // (ack-on-injection): the Client's pending state clears the
+        // moment the content is visible to the model. NOTE: this runs
+        // BEFORE the `messages` snapshot below, so an injected steer is
+        // part of THIS round's LLM request, not the next one.
+        inject_steers(state, session_id, round, &notify);
+
         let (messages, working_dir) = {
             let sessions = state.sessions_read();
             match sessions.get(session_id) {
@@ -670,8 +773,8 @@ pub async fn session_prompt(
                 }
             }
         };
-
         let backend = state.config.backend();
+
         // Open + drain the round's stream, with one bounded silent retry
         // when the round fails before notifying anything (issue #15).
         // Once a chunk has reached the Client, fail fast instead — a
@@ -783,6 +886,15 @@ pub async fn session_prompt(
         }
 
         if tool_calls.is_empty() {
+            // Steering (issue #30): steers that arrived while the final
+            // round was streaming would otherwise be stranded — the turn
+            // ends here and the round-boundary drain never runs again.
+            // Inject them and loop for one more round; the model must
+            // see the steer before the turn may end. (Next round the
+            // queue is empty and this guard passes through.)
+            if inject_steers(state, session_id, round, &notify) > 0 {
+                continue;
+            }
             got_final_response = true;
             if !content.is_empty() {
                 final_text = content.clone();
