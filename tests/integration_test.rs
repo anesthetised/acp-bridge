@@ -2949,9 +2949,11 @@ async fn test_cancel_without_turn_and_concurrent_prompt_guard() {
     let (_, response) = h.read_until_response(2);
     assert_eq!(response["result"]["status"], "completed");
 
-    // Second prompt while the first is still in flight → clean error.
-    // The mock router finishes instantly, so we cancel-then-prompt
-    // instead to prove the registry was cleaned: after the turn ended,
+    // Second prompt while the first is still in flight → it is QUEUED
+    // and injected as a user message at the next tool-round boundary
+    // (issue #30 steering). The mock router finishes instantly, so the
+    // queued steer is drained at the very next round boundary and its
+    // response carries the `steered` ack shape. After the turn ended,
     // a new prompt is accepted (not rejected with turn_in_progress).
     h.send(&json!({
         "jsonrpc":"2.0","id":3,"method":"session/prompt",
@@ -2959,6 +2961,220 @@ async fn test_cancel_without_turn_and_concurrent_prompt_guard() {
     }));
     let (_, response) = h.read_until_response(3);
     assert_eq!(response["result"]["status"], "completed");
+
+    h.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #30: steering — mid-turn prompts injected at tool-round boundaries
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_steer_reaches_model_in_same_turn() {
+    // A second session/prompt while a turn runs must NOT be rejected:
+    // it is queued, injected as a user message at the next tool-round
+    // boundary, and its own request is acked exactly then
+    // (ack-on-injection). The final answer of the ORIGINAL turn must
+    // reflect the steer — the model saw it in-context.
+
+    // Self-healing mock: while no steer is visible in history it keeps
+    // requesting a tool (forcing boundaries); once the injected steer
+    // appears in the user messages, it answers.
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(|req: Request<Body>| async move {
+                // Small delay so the steer reliably lands mid-turn.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                let steer_seen = body["messages"]
+                    .as_array()
+                    .map(|msgs| {
+                        msgs.iter().any(|m| {
+                            m["role"] == "user"
+                                && m["content"].as_str().unwrap_or("").contains("STEER_MARKER")
+                        })
+                    })
+                    .unwrap_or(false);
+                if steer_seen {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "STEER_ACK received"},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                    .into_response()
+                } else {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_steer_wait",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{\"path\": \".\"}"}
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // Original turn.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"work on the thing"}]}
+    }));
+
+    // Steer mid-turn, as soon as the first tool call shows the turn is
+    // in flight.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut saw_tool_call = false;
+    while !saw_tool_call {
+        assert!(
+            deadline > std::time::Instant::now(),
+            "turn never produced a tool call"
+        );
+        let msg = h.read_message();
+        if msg["params"]["update"]["sessionUpdate"] == "tool_call" {
+            saw_tool_call = true;
+        }
+    }
+    h.send(&json!({
+        "jsonrpc":"2.0","id":3,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"STEER_MARKER also check the config"}]}
+    }));
+
+    // The steer's ack arrives at injection — BEFORE the original turn's
+    // final response. v1 ack shape: stopReason end_turn, status steered.
+    // Ordering proof: the ack must come after round 0's tool completion
+    // (a tool_call_update), i.e. it was answered at a round boundary,
+    // not instantly at enqueue time.
+    let (steer_notifications, steer_response) = h.read_until_response(3);
+    assert_eq!(steer_response["result"]["status"], "steered");
+    assert_eq!(steer_response["result"]["stopReason"], "end_turn");
+    assert!(
+        steer_notifications
+            .iter()
+            .any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call_update"),
+        "steer acked only after the in-flight round's tool completed (boundary passed), got: {steer_notifications:?}"
+    );
+
+    // The original turn's final answer reflects the injected steer.
+    let (_, turn_response) = h.read_until_response(2);
+    assert_eq!(turn_response["result"]["stopReason"], "end_turn");
+    assert!(
+        turn_response["result"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("STEER_ACK"),
+        "model must see the steer in-context, got: {turn_response:?}"
+    );
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_steer_invalid_rejected_and_cancelled_steers_not_lost() {
+    // 1. An EMPTY steer is rejected immediately (never queued).
+    // 2. A valid steer queued behind a hung turn, then cancel: the held
+    //    steer request is answered as not-delivered — never silently
+    //    dropped — and the cancelled turn reports stopReason cancelled.
+
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(|_req: Request<Body>| async move {
+                // Hang: the turn stays in flight until cancelled.
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                axum::Json(json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "unreachable"},
+                        "finish_reason": "stop"
+                    }]
+                }))
+                .into_response()
+            }),
+        );
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"start"}]}
+    }));
+    // Give the turn a moment to register, then steer.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Empty steer → immediate validation error, nothing queued.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":3,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"   "}]}
+    }));
+    let (_, empty_resp) = h.read_until_response(3);
+    assert!(empty_resp.get("error").is_some(), "empty steer must error");
+
+    // Valid steer → queued (held open, no response yet).
+    h.send(&json!({
+        "jsonrpc":"2.0","id":4,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"real steer"}]}
+    }));
+
+    // Cancel the hung turn. The residual flush must answer the held
+    // steer with an error, and the turn with stopReason cancelled.
+    h.send(&json!({
+        "jsonrpc":"2.0","method":"session/cancel",
+        "params":{"sessionId":&sid}
+    }));
+
+    let (_, steer_resp) = h.read_until_response(4);
+    assert!(
+        steer_resp.get("error").is_some(),
+        "undelivered steer must be answered with an error, got: {steer_resp:?}"
+    );
+    assert!(
+        steer_resp["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not delivered"),
+        "error must say the steer was not delivered"
+    );
+
+    let (_, turn_resp) = h.read_until_response(2);
+    assert_eq!(turn_resp["result"]["stopReason"], "cancelled");
 
     h.shutdown();
 }

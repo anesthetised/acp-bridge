@@ -434,12 +434,40 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                     .expect("turn registry lock")
                                     .contains_key(&sid)
                                 {
-                                    acp::send_error_with_data(
-                                        &id,
-                                        -32001,
-                                        "A turn is already in progress for this session; send session/cancel first",
-                                        json!({ "reason": "turn_in_progress" }),
+                                    // Steering (issue #30): a mid-turn
+                                    // prompt is queued and injected as a
+                                    // user message at the next tool-round
+                                    // boundary — NOT rejected. Its
+                                    // JSON-RPC request is held open
+                                    // (answered by SteerAck on injection,
+                                    // or by the turn-end flush if the
+                                    // turn never reaches a boundary).
+                                    // Validation happens now: an invalid
+                                    // steer errors immediately, before
+                                    // anything is queued.
+                                    let raw = engine::extract_user_text_from_prompt(
+                                        &params.get("prompt").cloned().unwrap_or(Value::Null),
                                     );
+                                    let (text, _) = engine::strip_sender_context(&raw);
+                                    let images = engine::extract_user_images_from_prompt(
+                                        &params.get("prompt").cloned().unwrap_or(Value::Null),
+                                    );
+                                    if text.trim().is_empty() && images.is_empty() {
+                                        acp::send_error(
+                                            &id,
+                                            -32602,
+                                            "prompt (expected non-empty text or image content)",
+                                        );
+                                        continue;
+                                    }
+                                    let entry = engine::SteerEntry {
+                                        text,
+                                        images,
+                                        request_id: id.clone(),
+                                        message_id: uuid::Uuid::new_v4().to_string(),
+                                    };
+                                    let queued = state.queue_steer(&sid, entry);
+                                    info!(session_id = %sid, queued, "Queued steer for in-flight turn");
                                     continue;
                                 }
                                 let generation = state
@@ -826,6 +854,27 @@ async fn handle_acp_prompt(
                     Some(Notification::TextChunk(text)) => {
                         acp::notify_text_for(state.protocol_version, &session_id, &text)
                     }
+                    Some(Notification::SteerAck {
+                        request_id,
+                        message_id,
+                    }) => {
+                        // Ack-on-injection (issue #30): the steer just
+                        // reached session history; answer the held
+                        // request now so the Client's pending state
+                        // clears exactly when the model can see it.
+                        if state.protocol_version == ProtocolVersion::V2 {
+                            acp::send_response(&request_id, json!({ "messageId": message_id }));
+                        } else {
+                            acp::send_response(
+                                &request_id,
+                                json!({
+                                    "stopReason": "end_turn",
+                                    "status": "steered",
+                                    "text": "",
+                                }),
+                            );
+                        }
+                    }
                     None => break, // engine task finished; all notifications seen
                 }
             }
@@ -876,6 +925,30 @@ async fn handle_acp_prompt(
                                     &text,
                                 )
                             }
+                            Notification::SteerAck {
+                                request_id,
+                                message_id,
+                            } => {
+                                // Ack-on-injection during the cancel
+                                // drain too (issue #30): a steer that
+                                // was injected in the instant before
+                                // cancellation still gets its response.
+                                if state.protocol_version == ProtocolVersion::V2 {
+                                    acp::send_response(
+                                        &request_id,
+                                        json!({ "messageId": message_id }),
+                                    );
+                                } else {
+                                    acp::send_response(
+                                        &request_id,
+                                        json!({
+                                            "stopReason": "end_turn",
+                                            "status": "steered",
+                                            "text": "",
+                                        }),
+                                    );
+                                }
+                            }
                         }
                     }
                     break;
@@ -890,6 +963,22 @@ async fn handle_acp_prompt(
         .lock()
         .expect("turn registry lock")
         .remove(&session_id);
+
+    // Steering (issue #30), no-loss guarantee: the turn is over —
+    // anything still queued either arrived in the final race window
+    // (queued after the last injection point but before deregistration)
+    // or the turn was cancelled with steers pending. Nothing may be
+    // silently dropped: each residual steer is answered HERE as a
+    // rejected/aborted response — the Client knows its message never
+    // reached the model and can resend it as a fresh prompt.
+    for steer in state.drain_steers(&session_id) {
+        warn!(session_id = %session_id, "Turn ended with steers still queued; answering as aborted");
+        acp::send_error(
+            &steer.request_id,
+            -32001,
+            "Steer not delivered: the turn ended before a tool-round boundary; resend as a new prompt",
+        );
+    }
 
     if cancelled {
         // Spec (issue #3): respond with the cancelled stop reason —

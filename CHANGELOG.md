@@ -25,6 +25,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Steering: mid-turn prompts inject at tool-round boundaries** — a
+  `session/prompt` sent while a turn is running is no longer rejected
+  with `turn_in_progress`. It is queued and injected as a real `user`
+  message at the next tool-round boundary, so the model addresses it
+  **in-context** instead of seeing it as a disconnected follow-up after
+  the turn ends. The held JSON-RPC request is answered exactly when the
+  content reaches session history (ack-on-injection: the Client's
+  pending state clears the moment the model can see the steer — v1 ack
+  `{stopReason: "end_turn", status: "steered"}`, v2 ack
+  `{messageId}`). The turn does not end while steers are queued: the
+  final-answer guard injects and continues instead. If the turn is
+  cancelled or ends before a boundary, every residual steer is answered
+  with an explicit "not delivered" error — never silently dropped, the
+  Client can resend it as a fresh prompt. Invalid steers (empty /
+  non-text-only) are rejected immediately at enqueue time. (Field
+  report: bb messages stuck at "Steer pending" for whole turns.) (#30)
+
 - **`diff` content blocks on file-mutating tool completions** — `edit`
   and `write_file` completions now append an ACP spec `diff` block
   (`{type: "diff", path, oldText, newText}`) to the `tool_call_update`
