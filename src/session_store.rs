@@ -141,13 +141,21 @@ impl SessionStore {
         // the `agent` column recording which agent config persisted a
         // session. Fresh databases skip straight to v2.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        // Idempotent by schema, not by version marker: pre-#22 binaries
+        // unconditionally reset user_version to 1 on startup, so a
+        // DB that already carries the column can present as v1.
+        // Trusting the marker alone made ALTER fail with "duplicate
+        // column name" and disabled persistence for that process.
+        let has_agent: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('sessions') WHERE name = 'agent'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        if !has_agent {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN agent TEXT;")?;
+        }
         if version < 2 {
-            // `IF NOT EXISTS`-style guard isn't supported by ALTER
-            // TABLE, but this only runs for user_version <= 1 rows.
-            conn.execute_batch(
-                "ALTER TABLE sessions ADD COLUMN agent TEXT;
-                 PRAGMA user_version = 2;",
-            )?;
+            conn.pragma_update(None, "user_version", 2)?;
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -436,6 +444,43 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_tolerates_column_without_version_bump() {
+        // The exact corrupted state observed in the wild (issue #22
+        // follow-up): a pre-#22 binary reset user_version back to 1
+        // after a v2 binary had already added the column. Opening must
+        // succeed, bump the version, and keep the stamped rows.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 session_id       TEXT PRIMARY KEY,
+                 cwd              TEXT NOT NULL,
+                 protocol_version INTEGER NOT NULL,
+                 title            TEXT,
+                 created_at       INTEGER NOT NULL,
+                 updated_at       INTEGER NOT NULL,
+                 messages         TEXT NOT NULL,
+                 agent            TEXT
+             );
+             INSERT INTO sessions VALUES ('s', '/tmp', 1, NULL, 1, 1, '[]', 'test-model');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        let store = SessionStore::init(conn).unwrap();
+
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(
+            store.load("s").unwrap().unwrap().agent.as_deref(),
+            Some("test-model")
+        );
     }
 
     #[test]
