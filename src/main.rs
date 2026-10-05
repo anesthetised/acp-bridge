@@ -849,31 +849,24 @@ async fn handle_acp_prompt(
         _ => "other",
     };
     debug!(prompt_kind, "session/prompt input shape");
-    // Selection-intent carrier (bb#4433 research): bb's composer
-    // attaches the picked model/reasoning to the prompt request as
-    // fields. acp-bridge owns model state in-session, so it ignores
-    // them — log what actually arrived so intent delivery is
-    // verifiable on the wire.
+    // Selection-intent carrier (bb#4433 research): bb's composer may
+    // attach model/reasoning to the prompt request as fields. Log the
+    // full top-level key set plus any non-standard field values, so
+    // intent delivery is verifiable regardless of field naming.
     if let Some(fields) = params.as_object() {
-        let intent: serde_json::Map<String, Value> = fields
+        let mut keys: Vec<&String> = fields.keys().collect();
+        keys.sort();
+        let standard = ["sessionId", "prompt", "mcpServers", "_meta"];
+        let extras: serde_json::Map<String, Value> = fields
             .iter()
-            .filter(|(k, _)| {
-                matches!(
-                    k.as_str(),
-                    "model"
-                        | "reasoning"
-                        | "reasoningEffort"
-                        | "reasoning_effort"
-                        | "thinkingLevel"
-                        | "thinking_level"
-                        | "configOptions"
-                )
-            })
+            .filter(|(k, _)| !standard.contains(&k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        if !intent.is_empty() {
-            debug!(?intent, "session/prompt carries selection-intent fields");
-        }
+        debug!(
+            keys = %keys.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","),
+            ?extras,
+            "session/prompt top-level fields"
+        );
     }
 
     let raw_user_text = engine::extract_user_text_from_prompt(&prompt_value);
