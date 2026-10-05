@@ -99,6 +99,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   stays: it bounds API spend and time-to-response for degenerate models
   and maps to ACP `stopReason: "max_turn_requests"`. (#1)
 
+- **Removed the synthetic `llm_chat` turn wrapper from the wire** —
+  every turn used to be bracketed by a fake `tool_call` /
+  `tool_call_update` pair with `name: "llm_chat"` so Clients would
+  render *something* during the LLM round-trip. Since real tool calls
+  carry name/title/rawInput (issue #14) and text/thought chunks stream
+  live, the wrapper was pure noise: an opaque, uninformative "Turn"
+  bubble the user reported as such. `tool_call` /
+  `tool_call_update` notifications now only ever represent
+  model-invoked tools. Clients that keyed turn-start visibility on the
+  wrapper should use streamed chunks and `usage_update` instead — and
+  protocol tests that quietly relied on the wrapper now exercise real
+  tool rounds. (#27)
+
 ## [0.9.1] - 2026-10-03
 
 ### Fixed — ACP v2 wire-shape blockers

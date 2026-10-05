@@ -208,9 +208,7 @@ pub enum Notification {
     },
     ToolStart {
         /// ACP v1 `toolCallId` — required for clients to pair tool_call /
-        /// tool_call_update updates. The LLM assigns this id per call; for
-        /// the synthetic outer `llm_chat` event we mint a stable id derived
-        /// from the session/round so clients can render it.
+        /// tool_call_update updates. The LLM assigns this id per call.
         id: String,
         /// Programmatic tool name (`read_file`, `bash`, …).
         name: String,
@@ -253,7 +251,16 @@ pub struct AppState {
     /// `no_persistence` rejection. Shared via `Arc` so `AppState` stays
     /// cheaply cloneable.
     pub store: Option<Arc<crate::session_store::SessionStore>>,
+    /// In-flight turn registry for `session/cancel` (issue #3): one
+    /// entry per session with a running prompt turn. The value is the
+    /// turn's generation counter plus a `watch` channel that the
+    /// cancel handler flips; the turn's response task selects on it.
+    /// Turns are keyed by session — a session runs at most one turn.
+    pub turn_registry: Arc<std::sync::Mutex<HashMap<String, TurnEntry>>>,
 }
+
+/// One in-flight turn: generation counter + cancel flag (issue #3).
+pub type TurnEntry = (u64, tokio::sync::watch::Sender<bool>);
 
 impl Clone for AppState {
     fn clone(&self) -> Self {
@@ -262,6 +269,7 @@ impl Clone for AppState {
             config: self.config.clone(),
             protocol_version: self.protocol_version,
             store: self.store.clone(),
+            turn_registry: Arc::clone(&self.turn_registry),
         }
     }
 }
@@ -285,6 +293,7 @@ impl AppState {
             // AppState directly get v1 wire format without ceremony.
             protocol_version: crate::protocol::ProtocolVersion::V1,
             store,
+            turn_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -619,12 +628,11 @@ pub async fn session_prompt(
         }
     }
 
-    notify(Notification::Thinking);
-    notify(Notification::ToolStart {
-        id: format!("llm_chat:{session_id}"),
-        name: "llm_chat".into(),
-        args: Value::Null,
-    });
+    // NOTE: no turn-level synthetic tool_call here — `tool_call`
+    // notifications represent model-invoked tools, and the real per-round
+    // tool calls (with specifics, since #14) plus the streamed chunks
+    // already tell the Client what is happening. The old synthetic
+    // `llm_chat` wrapper rendered as bare noise in Clients.
 
     let mut had_error = false;
     let mut got_final_response = false;
@@ -660,42 +668,80 @@ pub async fn session_prompt(
         };
 
         let backend = state.config.backend();
-        let (mut rx, mut round_error) =
-            match llm::chat_streamed(&state.config, &messages, None, Some(&tool_defs)).await {
-                Ok(rx) => (Some(rx), None),
-                Err(e) => (None, Some(e)),
-            };
-
-        // Drain this round's stream. Parsers guarantee Thinking before
-        // Content before ToolCall and exactly one terminal event (Error
-        // or Done). Reasoning and text are notified as they arrive — the
-        // point of the streaming loop (issue #11) — while the accumulated
-        // forms feed the session history and the turn result.
-        let mut reasoning = String::new();
+        // Open + drain the round's stream, with one bounded silent retry
+        // when the round fails before notifying anything (issue #15).
+        // Once a chunk has reached the Client, fail fast instead — a
+        // retry would re-generate and duplicate already-visible output.
+        let mut notified_any = false;
         let mut content = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
-        if let Some(rx) = rx.as_mut() {
-            while let Some(chunk) = rx.recv().await {
-                match chunk {
-                    llm::StreamChunk::Thinking(t) => {
-                        reasoning.push_str(&t);
-                        notify(Notification::ThinkingText { text: t });
+        let mut round_error: Option<crate::llm::LlmError> = None;
+        for attempt in 0..2 {
+            // The receiver is loop-local: once the round's stream ends
+            // (normally or by error) it has no further use.
+            let (mut rx, round_err) =
+                match llm::chat_streamed(&state.config, &messages, None, Some(&tool_defs)).await {
+                    Ok(rx) => (Some(rx), None),
+                    Err(e) => (None, Some(e)),
+                };
+            round_error = round_err;
+            if round_error.is_some() {
+                break;
+            }
+
+            // Drain this round's stream. Parsers guarantee Thinking
+            // before Content before ToolCall and exactly one terminal
+            // event (Error or Done). Reasoning and text are notified as
+            // they arrive — the point of the streaming loop (issue #11)
+            // — while the accumulated forms feed the session history and
+            // the turn result.
+            if let Some(rx) = rx.as_mut() {
+                while let Some(chunk) = rx.recv().await {
+                    match chunk {
+                        llm::StreamChunk::Thinking(t) => {
+                            notified_any = true;
+                            notify(Notification::ThinkingText { text: t });
+                        }
+                        llm::StreamChunk::Content(t) => {
+                            notified_any = true;
+                            content.push_str(&t);
+                            notify(Notification::TextChunk(t));
+                        }
+                        llm::StreamChunk::ToolCall(call) => {
+                            notified_any = true;
+                            tool_calls.push(call)
+                        }
+                        llm::StreamChunk::Error(message, kind) => {
+                            round_error = Some(crate::llm::LlmError {
+                                kind,
+                                message,
+                                status: None,
+                            });
+                        }
+                        llm::StreamChunk::Done => break,
                     }
-                    llm::StreamChunk::Content(t) => {
-                        content.push_str(&t);
-                        notify(Notification::TextChunk(t));
-                    }
-                    llm::StreamChunk::ToolCall(call) => tool_calls.push(call),
-                    llm::StreamChunk::Error(message, kind) => {
-                        round_error = Some(crate::llm::LlmError {
-                            kind,
-                            message,
-                            status: None,
-                        });
-                    }
-                    llm::StreamChunk::Done => break,
                 }
             }
+
+            if let Some(err) = round_error.take() {
+                if attempt == 0 && !notified_any {
+                    // Nothing reached the Client — a single silent retry
+                    // is invisible and strictly better than killing a
+                    // long turn (issue #15). Reset accumulators.
+                    warn!(
+                        attempt,
+                        kind = err.kind.as_str(),
+                        "Round failed before notifying anything; retrying once"
+                    );
+                    notified_any = false;
+                    content.clear();
+                    tool_calls.clear();
+                    continue;
+                }
+                round_error = Some(err);
+                break;
+            }
+            break;
         }
 
         if let Some(e) = round_error {
@@ -861,12 +907,6 @@ pub async fn session_prompt(
     }
 
     let status = if had_error { "failed" } else { "completed" };
-    notify(Notification::ToolDone {
-        id: format!("llm_chat:{session_id}"),
-        name: "llm_chat".into(),
-        status: status.into(),
-        result: None,
-    });
 
     // Estimate the current context utilization for `usage_update`. Local
     // backends rarely stream per-turn token counts in a stable shape, so

@@ -15,9 +15,87 @@
 #[path = "harness.rs"]
 mod harness;
 
+use axum::response::IntoResponse;
 use harness::Agent;
 use serde_json::{json, Value};
 use std::time::Duration;
+
+/// Mock LLM backend for these tests: answers the first request with a
+/// real `list_dir` tool call and any request that already carries a
+/// tool result with plain text. Replaces the removed synthetic
+/// `llm_chat` turn wrapper as the source of tool-shaped notifications
+/// — the wrapper was masking that these tests ran against a dead LLM.
+fn start_mock_llm() -> (tokio::runtime::Runtime, u16) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for mock LLM");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock LLM");
+    let port = listener.local_addr().unwrap().port();
+    listener
+        .set_nonblocking(true)
+        .expect("set mock LLM listener nonblocking");
+    let app = axum::Router::new()
+        .route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                axum::Json(json!({"data": [{"id": "test-model", "object": "model"}]}))
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(tool_round_completions),
+        );
+    rt.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        axum::serve(listener, app).await.expect("mock LLM server");
+    });
+    (rt, port)
+}
+
+async fn tool_round_completions(req: axum::extract::Request) -> impl axum::response::IntoResponse {
+    let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+        .await
+        .expect("read request body");
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+
+    // A 400 on `stream: true` triggers the engine's setup-time
+    // invisible fallback to non-streaming (issue #11 policy), so this
+    // mock only ever needs to speak non-streaming JSON.
+    if body["stream"].as_bool().unwrap_or(false) {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let has_tool_result = body["messages"]
+        .as_array()
+        .map(|msgs| msgs.iter().any(|m| m["role"] == "tool"))
+        .unwrap_or(false);
+    if has_tool_result {
+        axum::Json(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "Project structure listed."},
+                "finish_reason": "stop"
+            }]
+        }))
+        .into_response()
+    } else {
+        axum::Json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_v1v2",
+                        "type": "function",
+                        "function": {"name": "list_dir", "arguments": "{\"path\": \".\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .into_response()
+    }
+}
 
 /// Minimal v2 Client `initialize` payload, modelled on the published
 /// `InitializeRequest` schema.
@@ -68,7 +146,9 @@ fn v2_tool_call_uses_tool_call_update_not_tool_call() {
     // v2 removed the `tool_call` sessionUpdate entirely. When the
     // Client is on v2, the tool-loop start notification must arrive
     // as `tool_call_update` with `status: "in_progress"`.
-    let mut a = Agent::spawn(&[]);
+    let (_llm, port) = start_mock_llm();
+    let base_url = format!("http://127.0.0.1:{port}/v1");
+    let mut a = Agent::spawn(&[("LLM_BASE_URL", base_url.as_str())]);
     a.request(1, "initialize", v2_init());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
@@ -211,7 +291,9 @@ fn v2_does_not_emit_state_update_for_v1_clients() {
     // The v2-only state_update must not leak into the v1 wire, or
     // v1 Clients (which have no idea what state_update means) would
     // get spurious sessionUpdate discriminators.
-    let mut a = Agent::spawn(&[]);
+    let (_llm, port) = start_mock_llm();
+    let base_url = format!("http://127.0.0.1:{port}/v1");
+    let mut a = Agent::spawn(&[("LLM_BASE_URL", base_url.as_str())]);
     a.request(
         1,
         "initialize",
@@ -242,7 +324,8 @@ fn v2_does_not_emit_state_update_for_v1_clients() {
         "v1 Clients must not receive state_update (it's a v2-only notification)"
     );
 
-    // And v1 must still get the legacy `tool_call` sessionUpdate.
+    // And v1 must still get the legacy `tool_call` sessionUpdate —
+    // from the real model-invoked `list_dir` round.
     let v1_tool_call_count = notifications
         .iter()
         .filter(|m| m["params"]["update"]["sessionUpdate"] == "tool_call")
