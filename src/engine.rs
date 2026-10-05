@@ -899,6 +899,54 @@ pub async fn session_prompt(
         }
     };
 
+    // Context compaction (issue #25): before appending this turn's
+    // user message, check whether the previous round's reported prompt
+    // tokens crossed the configured fraction of the context window. If
+    // so, summarize everything older than the recent tail into a
+    // rolling note — the scissors (trim_history) become the fallback,
+    // not the primary defense. Failures degrade to the plain trim.
+    let compaction_split = {
+        let sessions = state.sessions_read();
+        let session = sessions.get(session_id);
+        match session {
+            Some(s) => should_compact(&state.config, s.last_used_tokens.map(|u| (u, 0)), s),
+            None => None,
+        }
+    };
+    if let Some((used, threshold)) = compaction_split {
+        // Cut point: keep the recent half of history (same tail size
+        // trim_history would keep) so the model retains immediate
+        // context; everything before it gets summarized.
+        let split = {
+            let sessions = state.sessions_read();
+            sessions
+                .get(session_id)
+                .and_then(|s| s.compaction_split(state.config.max_history_turns.max(4)))
+                .unwrap_or(1)
+        };
+        match compact_session(state, session_id, split).await {
+            Ok(summary) => {
+                info!(
+                    session_id,
+                    used_tokens = used,
+                    threshold_tokens = threshold,
+                    summary_chars = summary.len(),
+                    "Context compacted: older rounds summarized"
+                );
+                notify(Notification::ThinkingText {
+                    text: format!(
+                        "[acp-bridge: context compacted — older rounds summarized \
+({} chars) to stay within the model window]",
+                        summary.len()
+                    ),
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, session_id, "Compaction failed; falling back to trim");
+            }
+        }
+    }
+
     // Add user message, touch session, and trim history
     {
         let mut sessions = state.sessions_write();
@@ -933,7 +981,10 @@ pub async fn session_prompt(
                 .format_user_message(user_text, user_images),
         );
 
-        if state.config.max_history_turns > 0 {
+        // Scissors only when compaction did NOT just run (or is
+        // disabled): compacted sessions already lost their old tail,
+        // so trimming again would cut fresh context.
+        if state.config.max_history_turns > 0 && compaction_split.is_none() {
             let before = session.messages.len();
             session.trim_history(state.config.max_history_turns);
             let after = session.messages.len();
@@ -1309,6 +1360,12 @@ pub async fn session_prompt(
                 .unwrap_or(0)
         }
     };
+    // Record for the next turn's compaction trigger (issue #25).
+    if let Some(sessions) = state.sessions.write().ok().as_mut() {
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.last_used_tokens = Some(used_tokens as u64);
+        }
+    }
 
     PromptResult {
         status: status.into(),
@@ -1406,6 +1463,133 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+// -- Context compaction (issue #25) -----------------------------------------
+
+/// Effective compaction trigger: `Some(fraction)` when enabled, `None`
+/// when disabled (threshold unset → default 0.75; explicit 0 → off;
+/// out-of-range values already filtered at config load).
+fn compaction_trigger_fraction(config: &LlmConfig) -> Option<f64> {
+    const DEFAULT_TRIGGER: f64 = 0.75;
+    match config.compaction_threshold {
+        Some(0.0) => None,
+        Some(t) => Some(t),
+        None => Some(DEFAULT_TRIGGER),
+    }
+}
+
+/// Decide whether compaction should run, from the most recent round's
+/// backend-reported prompt tokens (the real context occupancy) or the
+/// chars/4 estimate as fallback (same precedence as `usage_update`).
+fn should_compact(
+    config: &LlmConfig,
+    turn_usage: Option<(u64, u64)>,
+    session: &Session,
+) -> Option<(u64, u64)> {
+    let trigger = compaction_trigger_fraction(config)?;
+    if config.context_size == 0 {
+        return None;
+    }
+    let threshold = (config.context_size as f64 * trigger) as u64;
+    let used = match turn_usage {
+        Some((prompt, _completion)) => prompt,
+        None => estimate_tokens(&session.messages),
+    };
+    (used >= threshold).then_some((used, threshold))
+}
+
+/// Build the summarization request: a strict single-message chat call
+/// over the OLDER half of history (everything before `split`), with a
+/// system prompt that pins the output contract. No tools, no history —
+/// one shot.
+fn summarization_messages(older: &[Value]) -> Vec<Value> {
+    vec![
+        json!({
+            "role": "system",
+            "content": "You summarize coding-agent conversation history for context reuse. \
+        Input is a JSON array of messages (system, user, assistant, tool). \
+        Produce a dense technical summary in English: what the session is about, \
+        what was already done (with file paths, commands, and outcomes), decisions made, \
+        and anything unfinished. No preamble, no markdown headers, 400 words max. \
+        You are writing notes for the next model turn, not for a human."
+        }),
+        json!({
+            "role": "user",
+            "content": serde_json::to_string(&older).unwrap_or_default(),
+        }),
+    ]
+}
+
+/// Compact the session: summarize everything before `split` into a
+/// rolling note and splice it in as a single system-level context
+/// message. On summarizer failure the session is left untouched —
+/// compaction is best-effort; the next turn will retry.
+pub async fn compact_session(
+    state: &AppState,
+    session_id: &str,
+    split: usize,
+) -> Result<String, crate::llm::LlmError> {
+    let older: Vec<Value> = {
+        let sessions = state.sessions_read();
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| crate::llm::LlmError {
+                kind: crate::llm::LlmErrorKind::Unknown,
+                message: "session vanished during compaction".into(),
+                status: None,
+            })?;
+        session.messages[1..split.max(1)].to_vec()
+    };
+    if older.is_empty() {
+        return Ok(String::new());
+    }
+
+    // Summarizer call: same client/timeouts, dedicated model when
+    // configured, no tools (chat() sends none when tools=None).
+    let mut config = state.config.clone();
+    if let Some(model) = &state.config.compaction_model {
+        config.model = model.clone();
+    }
+    let messages = summarization_messages(&older);
+    let summary_value = llm::chat(&config, &messages, None, None, None).await?;
+    let summary = state
+        .config
+        .backend()
+        .extract_response_text(&summary_value)
+        .trim()
+        .to_string();
+
+    let mut sessions = state.sessions_write();
+    let session = sessions
+        .get_mut(session_id)
+        .ok_or_else(|| crate::llm::LlmError {
+            kind: crate::llm::LlmErrorKind::Unknown,
+            message: "session vanished during compaction splice".into(),
+            status: None,
+        })?;
+    // Re-validate the boundary: the turn that ran concurrently may
+    // have appended messages; cut only at a message that is not part
+    // of an unfinished tool round.
+    let split = split.min(session.messages.len());
+    let system = session.messages[0].clone();
+    let tail: Vec<Value> = session.messages[split..].to_vec();
+    session.messages = vec![
+        system,
+        json!({
+            "role": "user",
+            "content": format!(
+                "[Context compacted by acp-bridge to stay within the model window. \
+        Summary of the conversation so far: {summary}]"
+            ),
+        }),
+        json!({
+            "role": "assistant",
+            "content": "Understood — continuing from that summary."
+        }),
+    ];
+    session.messages.extend(tail);
+    Ok(summary)
 }
 
 /// One conversation-history entry mapped back to a Client-visible
@@ -1550,11 +1734,12 @@ pub fn session_restore(
         last_active: std::time::Instant::now(),
         working_dir: PathBuf::from(&record.cwd),
         protocol_version: state.protocol_version,
-        // Pinned decision on #13: the effort choice is in-memory only —
-        // a restored session resets to the config default.
+        // Pinned decisions on #13/#40: overrides are in-memory only —
+        // a restored session resets to the config defaults (level and
+        // model), and occupancy restarts from zero until a round runs.
         thought_level: None,
-        // Same policy for the model override (issue #40).
         model_override: None,
+        last_used_tokens: None,
     };
     state
         .sessions_write()
@@ -1639,6 +1824,9 @@ mod tests {
     use super::*;
     use crate::llm::Backend;
     use crate::protocol::ProtocolVersion;
+    use axum::body::Body;
+    use axum::routing::post;
+    use axum::Router;
 
     #[test]
     fn extract_user_text_handles_acp_array_shape() {
@@ -1837,6 +2025,8 @@ mod tests {
             prompt_supports_image: supports_image,
             context_size: 32768,
             available_models: Vec::new(),
+            compaction_threshold: None,
+            compaction_model: None,
             thought_levels: Vec::new(),
             thought_levels_set: false,
             request_overrides: serde_json::Map::new(),
@@ -2088,6 +2278,168 @@ mod tests {
         )
         .is_err());
         assert!(state.sessions_read().get("s_never").is_none());
+    }
+
+    // -- compaction (issue #25) ------------------------------------------------
+
+    #[test]
+    fn compaction_trigger_matrix() {
+        // None (unset) → default 0.75; Some(0.0) → disabled;
+        // Some(0.5) → honored.
+        assert_eq!(
+            compaction_trigger_fraction(&cfg_with_image(false)),
+            Some(0.75)
+        );
+        let mut cfg = cfg_with_image(false);
+        cfg.compaction_threshold = Some(0.0);
+        assert_eq!(compaction_trigger_fraction(&cfg), None);
+        cfg.compaction_threshold = Some(0.5);
+        assert_eq!(compaction_trigger_fraction(&cfg), Some(0.5));
+    }
+
+    #[test]
+    fn should_compact_uses_reported_tokens_over_estimate() {
+        let mut cfg = cfg_with_image(false);
+        cfg.context_size = 1000;
+        cfg.compaction_threshold = Some(0.5);
+        let session = Session::new(
+            json!({"role":"system","content":"s"}),
+            "/tmp".into(),
+            ProtocolVersion::V1,
+        );
+
+        // Backend-reported 600/1000 ≥ 50% → compact, threshold 500.
+        assert_eq!(
+            should_compact(&cfg, Some((600, 10)), &session),
+            Some((600, 500))
+        );
+
+        // Reported 400 → below threshold, no compaction — even though
+        // a huge history would estimate higher (reported wins).
+        let mut big = session.clone();
+        big.messages = vec![
+            json!({"role":"system","content":"s"}),
+            json!({"role":"user","content":"x".repeat(100000)}),
+        ];
+        assert_eq!(should_compact(&cfg, Some((400, 10)), &big), None);
+
+        // No report → falls back to chars/4 estimate; big history compacts.
+        assert!(should_compact(&cfg, None, &big).is_some());
+
+        // Zero context size → never compacts (no window to exceed).
+        cfg.context_size = 0;
+        assert_eq!(should_compact(&cfg, Some((9999, 0)), &session), None);
+    }
+
+    #[test]
+    fn compaction_split_respects_turn_boundary() {
+        let mut session = Session::new(
+            json!({"role":"system","content":"s"}),
+            "/tmp".into(),
+            ProtocolVersion::V1,
+        );
+        // 6 messages after the system prompt = 3 turns.
+        for i in 0..3 {
+            session
+                .messages
+                .push(json!({"role":"user","content":format!("u{i}")}));
+            session
+                .messages
+                .push(json!({"role":"assistant","content":format!("a{i}")}));
+        }
+        // keep = 2 turns (4 messages) → split at 1+6-4 = 3.
+        assert_eq!(session.compaction_split(2), Some(3));
+        // Everything fits → no split.
+        assert_eq!(session.compaction_split(10), None);
+    }
+
+    #[tokio::test]
+    async fn compaction_summarizes_into_rolling_note() {
+        // End-to-end: threshold crossed → summarizer called with the
+        // OLDER messages only → session spliced to system + summary
+        // pair + recent tail; tail and system preserved verbatim.
+        let router: Router = Router::new().route(
+            "/v1/chat/completions",
+            post(|req: axum::extract::Request<Body>| async move {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                // The summarizer sends exactly two messages: system
+                // contract + the older history as a JSON string.
+                let msgs = body["messages"].as_array().unwrap();
+                assert_eq!(msgs.len(), 2, "summarizer shape: {msgs:?}");
+                assert!(msgs[0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("summarize coding-agent"));
+                let older = msgs[1]["content"].as_str().unwrap();
+                assert!(older.contains("OLD_FACT"), "older history must be summarized, got: {older}");
+                assert!(!older.contains("RECENT"), "recent tail must NOT be summarized, got: {older}");
+                axum::Json(json!({
+                    "choices": [{"message": {"role": "assistant", "content": "OLD_FACT noted; work half done."}}]
+                }))
+            }),
+        );
+        // split: max_history_turns=2 → keep 4 messages → split at 5-4=1... 5 messages total → split = 1: everything but system is "older", so include the marker via tail check below.
+        // Serve the mock on an ephemeral port and point the agent at it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let mut cfg = cfg_with_image(false);
+        cfg.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.context_size = 1000;
+        cfg.compaction_threshold = Some(0.1); // trigger immediately
+        let state = AppState::new(cfg);
+        state.sessions_write().insert(
+            "s1".into(),
+            Session::new(
+                json!({"role":"system","content":"SYS"}),
+                "/tmp".into(),
+                ProtocolVersion::V1,
+            ),
+        );
+        {
+            let mut sessions = state.sessions_write();
+            let s = sessions.get_mut("s1").unwrap();
+            s.messages = vec![
+                json!({"role":"system","content":"SYS"}),
+                json!({"role":"user","content":"remember OLD_FACT"}),
+                json!({"role":"assistant","content":"noted"}),
+                json!({"role":"user","content":"RECENT question"}),
+                json!({"role":"assistant","content":"RECENT answer"}),
+            ];
+        }
+        // Split = boundary between "older" (summarized) and the recent
+        // tail (kept verbatim): older = messages[1..3] (the OLD_FACT
+        // exchange), tail = messages[3..] (the RECENT pair). System
+        // (index 0) is never summarized.
+        let split = 3;
+        let summary = compact_session(&state, "s1", split).await.unwrap();
+        assert!(summary.contains("OLD_FACT"), "summary: {summary}");
+
+        let sessions = state.sessions_read();
+        let s = sessions.get("s1").unwrap();
+        assert_eq!(s.messages[0]["content"], "SYS", "system preserved");
+        assert!(
+            serde_json::to_string(&s.messages[1])
+                .unwrap()
+                .contains("OLD_FACT noted"),
+            "rolling note present: {:?}",
+            s.messages[1]
+        );
+        assert!(
+            serde_json::to_string(&s.messages[2])
+                .unwrap()
+                .contains("continuing from that summary"),
+            "ack present"
+        );
+        // Recent tail preserved verbatim after the note.
+        let tail_json = serde_json::to_string(&s.messages[3..]).unwrap();
+        assert!(tail_json.contains("RECENT"), "tail kept: {tail_json}");
     }
 
     #[test]

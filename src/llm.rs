@@ -359,6 +359,14 @@ pub struct LlmConfig {
     /// still display the percentage used.
     /// Override via `LLM_MODEL_CONTEXT` env var; defaults to 32768.
     pub context_size: u64,
+    /// Compaction trigger as a fraction of the context window (issue
+    /// #25). `None` = default 0.75; `Some(0.0)` = compaction disabled;
+    /// values outside 0..=1 are treated as unset by the config loader.
+    pub compaction_threshold: Option<f64>,
+    /// Model for the summarization call (issue #25). `None` = the
+    /// configured model. Intended for a cheaper dedicated summarizer
+    /// on gateways where one exists.
+    pub compaction_model: Option<String>,
     /// Opt-in reasoning-effort levels advertised to ACP Clients as a
     /// `thought_level` config option (issue #13, re-scoped to bb's
     /// `configOptions` surface). Empty = the safe default (issue #13
@@ -502,6 +510,8 @@ impl LlmConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32768),
+            compaction_threshold: None,
+            compaction_model: None,
             thought_levels_set: true,
             thought_levels: std::env::var("LLM_THOUGHT_LEVELS")
                 .ok()
@@ -1490,6 +1500,8 @@ mod tests {
             prompt_supports_image: false,
             context_size: 32768,
             available_models: Vec::new(),
+            compaction_threshold: None,
+            compaction_model: None,
             thought_levels: Vec::new(),
             thought_levels_set: false,
             request_overrides: serde_json::Map::new(),
