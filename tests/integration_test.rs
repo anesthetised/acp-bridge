@@ -431,7 +431,45 @@ async fn test_session_new_and_end() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_session_prompt_streaming() {
     let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    // Reasoning delta + streamed content: exercises the thinking path
+    // and the answer path of the streaming loop.
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                let chunks = vec![
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices":[{"delta":{"reasoning_content":"pondering"},"index":0}]})
+                    ),
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices":[{"delta":{"content":"Hello"},"index":0}]})
+                    ),
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices":[{"delta":{"content":" world"},"index":0}]})
+                    ),
+                    "data: [DONE]\n\n".to_string(),
+                ];
+                let stream = futures_lite::stream::iter(
+                    chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+                );
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+                    .into_response()
+            }),
+        );
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
 
     // Create session
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
@@ -459,19 +497,12 @@ async fn test_session_prompt_streaming() {
     let full_text: String = text_chunks.join("");
     assert_eq!(full_text, "Hello world");
 
-    // Verify thinking + tool notifications exist
+    // Verify thinking notifications exist (real reasoning delta from the
+    // mock, not a synthetic wrapper).
     let has_thinking = notifications
         .iter()
         .any(|m| m["params"]["update"]["sessionUpdate"] == "agent_thought_chunk");
-    let has_tool_start = notifications
-        .iter()
-        .any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call");
-    let has_tool_done = notifications
-        .iter()
-        .any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call_update");
     assert!(has_thinking, "Should have thinking notification");
-    assert!(has_tool_start, "Should have tool_call notification");
-    assert!(has_tool_done, "Should have tool_call_update notification");
 
     assert_eq!(response["result"]["status"], "completed");
 
@@ -1799,8 +1830,7 @@ async fn test_tool_round_limit_configurable() {
         response["result"]["text"]
     );
     // Each round executes one `list_dir` tool call; 2 rounds => exactly 2
-    // list_dir tool_call starts. (The turn is also wrapped in a synthetic
-    // `llm_chat` tool_call notification, which is excluded by title.)
+    // list_dir tool_call starts.
     // Note the wire shape: the session-update payload is nested under
     // params.update, mirroring send_session_update in src/acp.rs.
     let tool_starts = notifications
@@ -1977,10 +2007,10 @@ async fn test_initialize_does_not_advertise_image_by_default() {
 /// without it the per-tool timeline collapses and rendering degrades.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tool_call_notification_carries_tool_call_id_and_kind() {
-    std::env::set_var("LLM_SCENARIO", "tool_round_trip");
-
     let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    // A real tool round (list_dir) — tool_call notifications must carry
+    // the ids and kinds of actual model-invoked tools.
+    let mut h = TestHarness::start_with_router(port, mock_llm_tool_call_router()).await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -2067,7 +2097,41 @@ async fn test_tool_call_notification_carries_tool_call_id_and_kind() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_thought_chunk_carries_content_block() {
     let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    // Real reasoning delta from the streaming mock (not a synthetic
+    // wrapper) — the thought chunk must carry a typed content block.
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                let chunks = vec![
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices":[{"delta":{"reasoning_content":"weighing options"},"index":0}]})
+                    ),
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices":[{"delta":{"content":"Hello"},"index":0}]})
+                    ),
+                    "data: [DONE]\n\n".to_string(),
+                ];
+                let stream = futures_lite::stream::iter(
+                    chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+                );
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+                    .into_response()
+            }),
+        );
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();

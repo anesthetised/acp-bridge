@@ -208,9 +208,7 @@ pub enum Notification {
     },
     ToolStart {
         /// ACP v1 `toolCallId` — required for clients to pair tool_call /
-        /// tool_call_update updates. The LLM assigns this id per call; for
-        /// the synthetic outer `llm_chat` event we mint a stable id derived
-        /// from the session/round so clients can render it.
+        /// tool_call_update updates. The LLM assigns this id per call.
         id: String,
         /// Programmatic tool name (`read_file`, `bash`, …).
         name: String,
@@ -630,12 +628,11 @@ pub async fn session_prompt(
         }
     }
 
-    notify(Notification::Thinking);
-    notify(Notification::ToolStart {
-        id: format!("llm_chat:{session_id}"),
-        name: "llm_chat".into(),
-        args: Value::Null,
-    });
+    // NOTE: no turn-level synthetic tool_call here — `tool_call`
+    // notifications represent model-invoked tools, and the real per-round
+    // tool calls (with specifics, since #14) plus the streamed chunks
+    // already tell the Client what is happening. The old synthetic
+    // `llm_chat` wrapper rendered as bare noise in Clients.
 
     let mut had_error = false;
     let mut got_final_response = false;
@@ -910,12 +907,6 @@ pub async fn session_prompt(
     }
 
     let status = if had_error { "failed" } else { "completed" };
-    notify(Notification::ToolDone {
-        id: format!("llm_chat:{session_id}"),
-        name: "llm_chat".into(),
-        status: status.into(),
-        result: None,
-    });
 
     // Estimate the current context utilization for `usage_update`. Local
     // backends rarely stream per-turn token counts in a stable shape, so
