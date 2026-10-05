@@ -60,6 +60,15 @@ max_tool_rounds = 25
 #
 # thought_levels = ["low", "high", "max"]
 
+# Allowlist filter for the model list advertised to Clients (issue #48).
+# Advertised = models the backend reports ∩ this list, in this order;
+# the configured model is always included and stays the default.
+# Unset = advertise everything the backend reports (552 entries on
+# cometapi-scale gateways). Keep it short — Clients render one picker
+# entry per model, and discovery probes each advertised model once.
+#
+# models = ["glm-5.3-flash", "claude-fable-5", "claude-fable-5-1"]
+
 # ---------------------------------------------------------------------------
 # Client mode — spawn an external ACP agent (used with --client flag)
 # ---------------------------------------------------------------------------

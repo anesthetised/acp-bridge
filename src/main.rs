@@ -117,6 +117,11 @@ async fn main() {
         .as_ref()
         .map(|path| ConfigFile::load(std::path::Path::new(path)));
 
+    // Allowlist filter for the advertised model list (issue #48):
+    // TOML-only, so it comes from the config file; bare invocations
+    // (env-config) advertise everything the backend reports.
+    let models_allowlist = config_file.as_ref().and_then(|f| f.llm.models.clone());
+
     let config = match config_file {
         Some(file) => file.into_llm_config(),
         None => llm::LlmConfig::from_env(),
@@ -154,16 +159,14 @@ async fn main() {
 
     // Probe backend and capture the model list (issue #40): the
     // startup probe's result feeds the `model` config option so
-    // Clients can switch models per session.
+    // Clients can switch models per session. The allowlist filter
+    // (issue #48) is applied here — see `apply_models_allowlist`.
     let mut config = config;
-    config.available_models = {
-        let mut list = probe_backend(&config).await;
-        // The configured model is always offered and stays the default.
-        if !list.iter().any(|m| m == &config.model) {
-            list.insert(0, config.model.clone());
-        }
-        list
-    };
+    config.available_models = llm::LlmConfig::apply_models_allowlist(
+        &config.model,
+        probe_backend(&config).await,
+        models_allowlist.as_deref(),
+    );
 
     // Build shared state
     // Session persistence (issue #17): SQLite store unless disabled via

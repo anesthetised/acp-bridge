@@ -26,6 +26,12 @@ pub struct LlmSection {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub system_prompt: Option<String>,
+    /// Allowlist filter for the advertised model list (issue #48):
+    /// advertised = fetched ∩ `models`, config order wins, the
+    /// configured model is always included. Unset = advertise every
+    /// model the backend reports. A curation preference, not
+    /// deployment-specific — TOML only, no env twin.
+    pub models: Option<Vec<String>>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub timeout_secs: Option<u64>,
@@ -242,6 +248,20 @@ mod tests {
 
     fn env_guard() -> MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn models_allowlist_parses_from_toml() {
+        // Issue #48: [llm] models = [...] parses; omitted = None.
+        let cfg: ConfigFile =
+            toml::from_str("model = 'glm-a'\n[llm]\nmodels = ['glm-a', 'claude-x']\n").unwrap();
+        assert_eq!(
+            cfg.llm.models,
+            Some(vec!["glm-a".to_string(), "claude-x".to_string()])
+        );
+
+        let cfg: ConfigFile = toml::from_str("model = 'glm-a'\n[llm]\n").unwrap();
+        assert_eq!(cfg.llm.models, None);
     }
 
     #[test]
