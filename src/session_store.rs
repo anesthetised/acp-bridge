@@ -19,23 +19,33 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 
 /// Default database location following platform conventions:
-/// macOS `~/Library/Application Support/acp-bridge/sessions.db`,
-/// Linux `~/.local/state/acp-bridge/sessions.db` (XDG state home).
-pub fn default_db_path() -> PathBuf {
+/// macOS `~/Library/Application Support/acp-bridge/`,
+/// Linux `~/.local/state/acp-bridge/` (XDG state home). When a config
+/// path is known (issue #22) the filename carries its stem —
+/// `cometapi.toml` → `sessions-cometapi.db` — so multiple agent
+/// configs get isolated stores by default; bare invocations and
+/// explicit `ACP_SESSION_DB` are unaffected.
+pub fn default_db_path(config_path: Option<&str>) -> PathBuf {
+    let stem = config_path.and_then(|p| {
+        Path::new(p)
+            .file_stem()
+            .map(|s| format!("sessions-{}.db", s.to_string_lossy()))
+    });
+    let file = stem.unwrap_or_else(|| "sessions.db".to_string());
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     if cfg!(target_os = "macos") {
         Path::new(&home)
             .join("Library")
             .join("Application Support")
             .join("acp-bridge")
-            .join("sessions.db")
+            .join(file)
     } else {
         let state_home = std::env::var("XDG_STATE_HOME")
             .ok()
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| Path::new(&home).join(".local").join("state"));
-        state_home.join("acp-bridge").join("sessions.db")
+        state_home.join("acp-bridge").join(file)
     }
 }
 
@@ -52,6 +62,11 @@ pub struct SessionRecord {
     pub created_at: i64,
     pub updated_at: i64,
     pub messages: Vec<Value>,
+    /// Identity of the agent config that persisted this session
+    /// (issue #22): the config file stem (e.g. `cometapi`), or the
+    /// model name for bare invocations. `session/load` strict mode
+    /// compares this against the loading agent's identity.
+    pub agent: Option<String>,
 }
 
 #[derive(Debug)]
@@ -122,8 +137,18 @@ impl SessionStore {
                 messages         TEXT NOT NULL
             );",
         )?;
-        // Future schema migrations branch on this.
-        conn.pragma_update(None, "user_version", 1)?;
+        // Schema migrations branch on user_version (issue #22): v2 adds
+        // the `agent` column recording which agent config persisted a
+        // session. Fresh databases skip straight to v2.
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 2 {
+            // `IF NOT EXISTS`-style guard isn't supported by ALTER
+            // TABLE, but this only runs for user_version <= 1 rows.
+            conn.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN agent TEXT;
+                 PRAGMA user_version = 2;",
+            )?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -135,14 +160,15 @@ impl SessionStore {
         let conn = self.conn.lock().expect("session store lock poisoned");
         conn.execute(
             "INSERT INTO sessions (session_id, cwd, protocol_version, title,
-                                   created_at, updated_at, messages)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                   created_at, updated_at, messages, agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(session_id) DO UPDATE SET
                 cwd = excluded.cwd,
                 protocol_version = excluded.protocol_version,
                 title = excluded.title,
                 updated_at = excluded.updated_at,
-                messages = excluded.messages",
+                messages = excluded.messages,
+                agent = excluded.agent",
             rusqlite::params![
                 record.session_id,
                 record.cwd,
@@ -150,7 +176,8 @@ impl SessionStore {
                 record.title,
                 record.created_at,
                 record.updated_at,
-                messages
+                messages,
+                record.agent
             ],
         )?;
         Ok(())
@@ -161,7 +188,7 @@ impl SessionStore {
         let conn = self.conn.lock().expect("session store lock poisoned");
         let mut stmt = conn.prepare(
             "SELECT session_id, cwd, protocol_version, title,
-                    created_at, updated_at, messages
+                    created_at, updated_at, messages, agent
              FROM sessions WHERE session_id = ?1",
         )?;
         let mut rows = stmt.query(rusqlite::params![session_id])?;
@@ -178,6 +205,7 @@ impl SessionStore {
                     created_at: row.get(4)?,
                     updated_at: row.get(5)?,
                     messages,
+                    agent: row.get(7)?,
                 }))
             }
         }
@@ -213,7 +241,7 @@ impl SessionStore {
     pub fn list(&self) -> Result<Vec<Value>, StoreError> {
         let conn = self.conn.lock().expect("session store lock poisoned");
         let mut stmt = conn.prepare(
-            "SELECT session_id, cwd, title, updated_at
+            "SELECT session_id, cwd, title, updated_at, agent
              FROM sessions ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -222,6 +250,7 @@ impl SessionStore {
                 "cwd": row.get::<_, String>(1)?,
                 "title": row.get::<_, Option<String>>(2)?,
                 "updatedAt": row.get::<_, i64>(3)?,
+                "agent": row.get::<_, Option<String>>(4)?,
             }))
         })?;
         let mut out = Vec::new();
@@ -248,6 +277,7 @@ mod tests {
                 json!({"role": "user", "content": "hello"}),
                 json!({"role": "assistant", "content": "world"}),
             ],
+            agent: None,
         }
     }
 
@@ -313,6 +343,99 @@ mod tests {
             .map(|s| s["sessionId"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["sess_9", "sess_8", "sess_7"]);
+    }
+
+    #[test]
+    fn agent_roundtrip_and_visible_in_list() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let mut rec = record("sess_agent", 1000);
+        rec.agent = Some("cometapi".into());
+        store.save(&rec).unwrap();
+
+        let loaded = store.load("sess_agent").unwrap().unwrap();
+        assert_eq!(loaded.agent.as_deref(), Some("cometapi"));
+
+        let list = store.list().unwrap();
+        assert_eq!(list[0]["agent"], "cometapi");
+
+        // Overwrite keeps the stamped identity.
+        store.save(&rec).unwrap();
+        assert_eq!(
+            store.load("sess_agent").unwrap().unwrap().agent.as_deref(),
+            Some("cometapi")
+        );
+    }
+
+    #[test]
+    fn default_db_path_derives_filename_from_config_stem() {
+        // Issue #22: `cometapi.toml` → `sessions-cometapi.db`; bare
+        // invocations keep `sessions.db`.
+        assert_eq!(
+            default_db_path(Some("/home/u/.config/acp-bridge/cometapi.toml"))
+                .file_name()
+                .unwrap(),
+            "sessions-cometapi.db"
+        );
+        assert_eq!(
+            default_db_path(Some("ollama.toml")).file_name().unwrap(),
+            "sessions-ollama.db"
+        );
+        assert_eq!(default_db_path(None).file_name().unwrap(), "sessions.db");
+    }
+
+    #[test]
+    fn migration_v1_preserves_rows_and_adds_agent() {
+        // Simulate a pre-#22 database: v1 schema, one row, user_version 1.
+        let dir = std::env::temp_dir().join(format!(
+            "acp-bridge-mig-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     session_id       TEXT PRIMARY KEY,
+                     cwd              TEXT NOT NULL,
+                     protocol_version INTEGER NOT NULL,
+                     title            TEXT,
+                     created_at       INTEGER NOT NULL,
+                     updated_at       INTEGER NOT NULL,
+                     messages         TEXT NOT NULL
+                 );
+                 INSERT INTO sessions VALUES ('legacy', '/tmp', 1, NULL, 1, 1, '[]');
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+
+        // Reopening runs the migration: v1 rows survive with agent NULL,
+        // new saves stamp the agent, and the version is bumped.
+        let store = SessionStore::open(&path).unwrap();
+        let legacy = store.load("legacy").unwrap().unwrap();
+        assert_eq!(legacy.agent, None);
+
+        let mut rec = record("fresh", 2000);
+        rec.agent = Some("cometapi".into());
+        store.save(&rec).unwrap();
+
+        let version: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(version, 2);
+        assert_eq!(
+            store.load("fresh").unwrap().unwrap().agent.as_deref(),
+            Some("cometapi")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -158,6 +158,15 @@ pub enum AcpError {
 
     #[error("Invalid parameter: {field}")]
     InvalidParam { field: String },
+
+    #[error(
+        "Session {session_id} was persisted by agent '{stored}', not '{current}' (strict mode: ACP_SESSION_STRICT_MODELS)"
+    )]
+    AgentMismatch {
+        session_id: String,
+        stored: String,
+        current: String,
+    },
 }
 
 impl AcpError {
@@ -170,6 +179,7 @@ impl AcpError {
             AcpError::LlmError { .. } => -32003,       // Application error
             AcpError::SessionLimitReached { .. } => -32004, // Application error
             AcpError::InvalidParam { .. } => -32602,   // Invalid params
+            AcpError::AgentMismatch { .. } => -32001,  // Application error
         }
     }
 }
