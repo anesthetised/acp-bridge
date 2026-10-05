@@ -171,6 +171,10 @@ Ollama is supported natively via `/api/chat` (NDJSON streaming). All other backe
 # Build
 cargo build --release
 
+# Development: run the full gate before pushing (fmt → clippy → test,
+# same order and flags as CI)
+just gate
+
 # Run with Ollama (default)
 ./target/release/acp-bridge
 
