@@ -101,6 +101,14 @@ async fn main() {
                 .init();
         }
     }
+    // Binary identity (reports should be actionable): the git short
+    // hash stamped at build time, logged after tracing init so it
+    // lands in the ACP_LOG_FILE under stderr-swallowing hosts.
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        build_hash = env!("ACP_BUILD_HASH"),
+        "binary identity"
+    );
 
     // Load config: CLI arg (optional TOML path) → env vars → defaults
     let config_path = args.iter().skip(1).find(|a| !a.starts_with('-')).cloned();
