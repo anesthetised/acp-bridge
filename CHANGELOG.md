@@ -25,6 +25,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Backend-reported usage numbers in `usage_update`** — the engine now
+  prefers the backend's own token counts over the chars/4 estimate
+  (issue #4): OpenAI-compatible responses' `usage` object (streaming
+  final chunk or non-streaming body — reasoning-model shapes with the
+  completion folded into `total_tokens` handled) and Ollama-native
+  `prompt_eval_count`/`eval_count` on the terminal chunk. Backends that
+  never report usage keep the estimate as fallback. No
+  `stream_options.include_usage` is requested — strict gateways reject
+  it with 400; usage is parsed when present instead, so no backend
+  changes behavior. This is the honest counting #25 (compaction) needs
+  to decide when to trigger.
+
 - **Backend request overrides (`[llm.request_overrides]`)** — arbitrary
   passthrough fields merged into the top level of every upstream
   request body, for knobs acp-bridge will never enumerate fast enough:

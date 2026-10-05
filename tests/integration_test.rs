@@ -2965,6 +2965,79 @@ async fn test_cancel_without_turn_and_concurrent_prompt_guard() {
     h.shutdown();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_usage_update_prefers_backend_reported_tokens() {
+    // Issue #4: when the backend reports usage (final SSE chunk with a
+    // `usage` object), usage_update must carry the REAL token count —
+    // not the chars/4 estimate. The mock's content ("Hi" = 2 chars ≈ 0
+    // estimated tokens) guarantees the estimate and the reported number
+    // diverge.
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(|_req: Request<Body>| async move {
+                let chunks = vec![
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices": [{"delta": {"content": "Hi"}}]})
+                    ),
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices": [], "usage": {"prompt_tokens": 1234, "completion_tokens": 56}})
+                    ),
+                    "data: [DONE]\n\n".to_string(),
+                ];
+                let stream = futures_lite::stream::iter(
+                    chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+                );
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+                    .into_response()
+            }),
+        );
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hi"}]}
+    }));
+    let (notifications, _response) = h.read_until_response(2);
+
+    let usage = notifications
+        .iter()
+        .find(|m| m["params"]["update"]["sessionUpdate"] == "usage_update")
+        .map(|m| {
+            (
+                m["params"]["update"]["used"].as_u64(),
+                m["params"]["update"]["size"].as_u64(),
+            )
+        });
+    let (used, size) = usage.expect("usage_update notification after turn");
+    assert_eq!(
+        used,
+        Some(1290),
+        "used must be backend-reported prompt+completion"
+    );
+    assert_eq!(size, Some(32768), "size is the configured context window");
+
+    h.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Issue #30: steering — mid-turn prompts injected at tool-round boundaries
 // ---------------------------------------------------------------------------

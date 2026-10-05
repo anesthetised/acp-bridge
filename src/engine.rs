@@ -734,6 +734,10 @@ pub async fn session_prompt(
     let mut had_error = false;
     let mut got_final_response = false;
     let mut final_text = String::new();
+    // Backend-reported usage for the most recent round (issue #4) —
+    // `None` until a backend actually reports; the final usage report
+    // prefers this over the chars/4 estimate.
+    let mut turn_usage: Option<(u64, u64)> = None;
     let mut last_error_class: Option<crate::llm::LlmErrorKind> = None;
     let tool_defs = tools::tool_definitions();
 
@@ -824,6 +828,16 @@ pub async fn session_prompt(
                                 message,
                                 status: None,
                             });
+                        }
+                        llm::StreamChunk::Usage {
+                            prompt_tokens,
+                            completion_tokens,
+                        } => {
+                            // Issue #4: backend-reported usage. Last round
+                            // wins — `prompt_tokens` is the cumulative
+                            // context for THIS round's request, so it
+                            // already includes everything before it.
+                            turn_usage = Some((prompt_tokens, completion_tokens));
                         }
                         llm::StreamChunk::Done => break,
                     }
@@ -1029,18 +1043,25 @@ pub async fn session_prompt(
 
     let status = if had_error { "failed" } else { "completed" };
 
-    // Estimate the current context utilization for `usage_update`. Local
-    // backends rarely stream per-turn token counts in a stable shape, so
-    // we estimate by summing the textual length of every message in the
-    // session history and dividing by 4 chars per token (the canonical
-    // LLM rule of thumb). This is intentionally approximate; clients use
-    // it for progress bars and not for cost attribution.
-    let used_tokens = {
-        let sessions = state.sessions_read();
-        sessions
-            .get(session_id)
-            .map(|s| estimate_tokens(&s.messages))
-            .unwrap_or(0)
+    // Context utilization for `usage_update` (issue #4): prefer the
+    // backend's own reported token counts from the most recent round —
+    // `prompt_tokens` is the real context occupancy of that request and
+    // `completion_tokens` its generation. Backends that never report
+    // usage fall back to the chars/4 estimate over session history
+    // (deliberately approximate; clients use this for progress bars,
+    // not cost attribution).
+    let used_tokens = match turn_usage {
+        Some((prompt, completion)) => {
+            debug!(prompt, completion, "Using backend-reported usage");
+            prompt + completion
+        }
+        None => {
+            let sessions = state.sessions_read();
+            sessions
+                .get(session_id)
+                .map(|s| estimate_tokens(&s.messages))
+                .unwrap_or(0)
+        }
     };
 
     PromptResult {

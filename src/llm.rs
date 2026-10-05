@@ -471,6 +471,17 @@ pub enum StreamChunk {
     /// chunks the client already saw); the kind feeds the same
     /// `data.category` error surface as setup-time failures.
     Error(String, LlmErrorKind),
+    /// Backend-reported token usage for the round (issue #4): emitted
+    /// when the backend includes a `usage` object (OpenAI-compatible
+    /// final chunk / non-streaming response) or eval counts (Ollama
+    /// native `done` chunk). `prompt_tokens` is cumulative context,
+    /// `completion_tokens` is this round's generation. Backends that
+    /// never report usage simply never emit this — the engine falls
+    /// back to its chars/4 estimate.
+    Usage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    },
     Done,
 }
 
@@ -959,7 +970,42 @@ async fn adapt_full_response(backend: Backend, response: Value, tx: &mpsc::Sende
     for call in backend.extract_tool_calls(&response) {
         let _ = tx.send(StreamChunk::ToolCall(call)).await;
     }
+    // Backend-reported usage (issue #4) — OpenAI-compatible responses
+    // carry `usage: {prompt_tokens, completion_tokens}` when they
+    // report at all.
+    if let Some(usage) = extract_usage_openai(&response) {
+        let _ = tx
+            .send(StreamChunk::Usage {
+                prompt_tokens: usage.0,
+                completion_tokens: usage.1,
+            })
+            .await;
+    }
     let _ = tx.send(StreamChunk::Done).await;
+}
+
+/// Pull `{prompt_tokens, completion_tokens}` from an OpenAI-compatible
+/// response `usage` object, tolerating absent or partially-populated
+/// objects. Returns `None` when the backend reports nothing usable.
+fn extract_usage_openai(response: &Value) -> Option<(u64, u64)> {
+    let usage = response.get("usage")?;
+    let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64());
+    // Reasoning models sometimes fold generation into `total_tokens`
+    // while `completion_tokens` reads 0 — a zero completion is treated
+    // as "absent" so the total-difference fallback can fire.
+    let completion = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .filter(|&c| c > 0);
+    let total = usage.get("total_tokens").and_then(|v| v.as_u64());
+    match (prompt, completion) {
+        (Some(p), Some(c)) => Some((p, c)),
+        (Some(p), None) => {
+            let t = total?;
+            (t > p).then_some((p, t - p))
+        }
+        _ => None,
+    }
 }
 
 /// One streamed tool call being assembled from OpenAI `delta.tool_calls`
@@ -1062,6 +1108,19 @@ async fn parse_ollama_native_stream(
                         // Check if done — after extraction, so a final
                         // chunk that still carries a call is not dropped.
                         if parsed.get("done").and_then(|d| d.as_bool()) == Some(true) {
+                            // Backend-reported usage (issue #4): the
+                            // terminal chunk carries eval token counts.
+                            if let (Some(p), Some(c)) = (
+                                parsed.get("prompt_eval_count").and_then(|v| v.as_u64()),
+                                parsed.get("eval_count").and_then(|v| v.as_u64()),
+                            ) {
+                                let _ = tx
+                                    .send(StreamChunk::Usage {
+                                        prompt_tokens: p,
+                                        completion_tokens: c,
+                                    })
+                                    .await;
+                            }
                             let _ = tx.send(StreamChunk::Done).await;
                             return;
                         }
@@ -1133,6 +1192,20 @@ async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Send
                     }
 
                     if let Ok(parsed) = serde_json::from_str::<Value>(data) {
+                        // Usage (issue #4): OpenAI-compatible backends
+                        // that report streaming usage emit it in a final
+                        // chunk with an empty `choices` array (or a null
+                        // delta). Parse-when-present — we deliberately
+                        // do NOT request it via `stream_options.include_usage`,
+                        // which strict/gatewated backends reject with 400.
+                        if let Some(usage) = extract_usage_openai(&parsed) {
+                            let _ = tx
+                                .send(StreamChunk::Usage {
+                                    prompt_tokens: usage.0,
+                                    completion_tokens: usage.1,
+                                })
+                                .await;
+                        }
                         let delta = parsed
                             .get("choices")
                             .and_then(|c| c.get(0))
@@ -1432,8 +1505,132 @@ mod tests {
         assert_eq!(body["tools"], json!(tools));
     }
 
-    // -- request_overrides (issue #2) ---------------------------------------
+    // -- usage capture (issue #4) -------------------------------------------
 
+    #[tokio::test]
+    async fn sse_stream_parses_usage_chunk() {
+        // OpenAI-compatible backends that report streaming usage emit a
+        // final chunk with an empty choices array before [DONE].
+        async fn sse() -> impl IntoResponse {
+            let chunks = vec![
+                format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"delta": {"content": "Hi"}}]})
+                ),
+                format!(
+                    "data: {}\n\n",
+                    json!({"choices": [], "usage": {"prompt_tokens": 1234, "completion_tokens": 56}})
+                ),
+                "data: [DONE]\n\n".to_string(),
+            ];
+            let stream = futures_lite::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+            );
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        let url = serve(Router::new().route("/v1/chat/completions", post(sse))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let mut rx = stream_chat(&cfg, &[], None).await.unwrap();
+
+        let mut usage: Option<(u64, u64)> = None;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                StreamChunk::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                } => usage = Some((prompt_tokens, completion_tokens)),
+                StreamChunk::Done => break,
+                _ => {}
+            }
+        }
+        assert_eq!(usage, Some((1234, 56)));
+    }
+
+    #[tokio::test]
+    async fn full_response_parses_usage() {
+        // Non-streaming / adapted responses carry `usage` at the top level.
+        async fn complete() -> impl IntoResponse {
+            Json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 7, "total_tokens": 107}
+            }))
+        }
+        let url = serve(Router::new().route("/v1/chat/completions", post(complete))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        // Content-type sniffing requires the non-streamed adaptation path.
+        let mut rx = stream_chat(&cfg, &[], None).await.unwrap();
+        let mut usage: Option<(u64, u64)> = None;
+        while let Some(chunk) = rx.recv().await {
+            if let StreamChunk::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } = chunk
+            {
+                usage = Some((prompt_tokens, completion_tokens));
+            }
+        }
+        assert_eq!(usage, Some((100, 7)));
+    }
+
+    #[tokio::test]
+    async fn ollama_native_done_chunk_parses_eval_counts() {
+        async fn ndjson() -> impl IntoResponse {
+            let lines = [
+                json!({"message": {"content": "Hi"}, "done": false}).to_string(),
+                json!({
+                    "message": {"content": ""},
+                    "done": true,
+                    "prompt_eval_count": 90,
+                    "eval_count": 11
+                })
+                .to_string(),
+            ];
+            let body = lines.join("\n") + "\n";
+            Response::builder()
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(body))
+                .unwrap()
+        }
+        let url = serve(Router::new().route("/api/chat", post(ndjson))).await;
+        let mut cfg = test_config(&url);
+        cfg.base_url = url.clone(); // native detection: no /v1 suffix
+        let rx = stream_chat(&cfg, &[], None).await.unwrap();
+        let mut usage: Option<(u64, u64)> = None;
+        let mut rx = rx;
+        while let Some(chunk) = rx.recv().await {
+            if let StreamChunk::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } = chunk
+            {
+                usage = Some((prompt_tokens, completion_tokens));
+            }
+        }
+        assert_eq!(usage, Some((90, 11)));
+    }
+
+    #[test]
+    fn extract_usage_tolerates_partial_and_reasoning_shapes() {
+        // No usage at all → None.
+        assert_eq!(extract_usage_openai(&json!({"choices": []})), None);
+        // Half-populated → None.
+        assert_eq!(
+            extract_usage_openai(&json!({"usage": {"prompt_tokens": 10}})),
+            None
+        );
+        // Reasoning-model shape: completion folded into total_tokens.
+        assert_eq!(
+            extract_usage_openai(&json!({
+                "usage": {"prompt_tokens": 100, "completion_tokens": 0, "total_tokens": 137}
+            })),
+            Some((100, 37))
+        );
+    }
+
+    // -- request_overrides (issue #2) ---------------------------------------
     #[test]
     fn request_overrides_merge_top_level() {
         let mut cfg = test_config("http://host/v1");
@@ -1650,6 +1847,7 @@ mod tests {
                 StreamChunk::Thinking(t) => thinking.push_str(&t),
                 StreamChunk::Content(c) => content.push_str(&c),
                 StreamChunk::ToolCall(_) => {}
+                StreamChunk::Usage { .. } => {}
                 StreamChunk::Done => break,
                 StreamChunk::Error(e, _) => panic!("unexpected stream error: {e}"),
             }
@@ -1702,6 +1900,7 @@ mod tests {
             match chunk {
                 StreamChunk::Thinking(_) => reasoning_before_calls = calls.is_empty(),
                 StreamChunk::ToolCall(call) => calls.push(call),
+                StreamChunk::Usage { .. } => {}
                 StreamChunk::Done => break,
                 StreamChunk::Content(_) => {}
                 StreamChunk::Error(e, _) => panic!("unexpected stream error: {e}"),
@@ -1762,6 +1961,7 @@ mod tests {
                     saw_terminal_error = true;
                     assert_eq!(kind, LlmErrorKind::Unreachable, "msg: {msg}");
                 }
+                StreamChunk::Usage { .. } => {}
                 StreamChunk::Done => break,
                 _ => {}
             }
@@ -1800,6 +2000,7 @@ mod tests {
                     order.push("content");
                     content.push_str(&c);
                 }
+                StreamChunk::Usage { .. } => {}
                 StreamChunk::Done => break,
                 StreamChunk::ToolCall(_) => {}
                 StreamChunk::Error(e, _) => panic!("unexpected stream error: {e}"),
@@ -1814,7 +2015,7 @@ mod tests {
         // Ollama native NDJSON: tool calls arrive whole (not fragmented);
         // thinking-mode models stream message.thinking before content.
         async fn ndjson() -> impl IntoResponse {
-            let lines = vec![
+            let lines = [
                 format!(
                     "{}\n",
                     json!({"message": {"thinking": "hmm"}, "done": false})
@@ -1846,6 +2047,7 @@ mod tests {
             match chunk {
                 StreamChunk::Thinking(t) => thinking.push_str(&t),
                 StreamChunk::ToolCall(call) => calls.push(call),
+                StreamChunk::Usage { .. } => {}
                 StreamChunk::Done => {
                     done = true;
                     break;
@@ -1920,6 +2122,7 @@ mod tests {
                 StreamChunk::Content(c) => text.push_str(&c),
                 StreamChunk::Thinking(t) => text.push_str(&t),
                 StreamChunk::ToolCall(_) => {}
+                StreamChunk::Usage { .. } => {}
                 StreamChunk::Done => {
                     done = true;
                     break;

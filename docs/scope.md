@@ -46,7 +46,7 @@ spec-compliant v2 payloads.
 | `plan` (v1) / `plan_update` (v2) | ✅ | `plan_update` carries `plan: {type: "items", planId, entries[]}` so v2 Clients can track multiple plans |
 | `available_commands_update` (v1 + v2) | ✅ | Slash-command menu: `/read`, `/ls`, `/search`, `/edit`, `/shell` |
 | `session_info_update` (v1 + v2) | ✅ | Title defaults to cwd basename, updated to first line of user prompt after each turn |
-| `usage_update` (v1 + v2) | ✅ | Estimated `used` (chars / 4 across session history) + `size` from `LLM_MODEL_CONTEXT` (default 32768) |
+| `usage_update` (v1 + v2) | ✅ | `used` prefers backend-reported token counts (OpenAI-compatible `usage` object, Ollama-native eval counts — parsed when present, never requested via `stream_options` which strict gateways 400); falls back to chars/4 across session history. `size` from `LLM_MODEL_CONTEXT` (default 32768) |
 | `state_update` (v2 only) | ✅ | Emitted at end of each prompt with `state: "idle"` + `stopReason`. v2 Clients ignore unknown discriminators so a v1 Client never sees it |
 | Request ID echo | ✅ | Numeric AND string/UUID request ids are echoed verbatim — fixes the issue where Meuxe's UUID ids were silently dropped |
 | Stdout framing | ✅ | Newline-delimited JSON, one object per line |
