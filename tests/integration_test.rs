@@ -3051,10 +3051,12 @@ async fn test_thought_level_config_option_flow() {
         "jsonrpc":"2.0","id":3,"method":"session/set_config_option",
         "params":{"sessionId":&sid,"configId":"thought_level","value":"max"}
     }));
-    let set_resp = h.read_message();
+    // Notifications from the in-flight turn (tool_call_update, …) may
+    // arrive between the request and its response — seek the response.
+    let (_, set_resp) = h.read_until_response(3);
     assert_eq!(
         set_resp["result"]["configOptions"][0]["currentValue"], "max",
-        "set_config_option returns the updated option"
+        "set_config_option returns the updated option, got: {set_resp:?}"
     );
 
     // The original turn's final answer proves the next round's body
