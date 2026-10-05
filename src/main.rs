@@ -140,9 +140,14 @@ async fn main() {
     let store = if persistence_disabled {
         None
     } else {
+        // Issue #22: derive the default DB filename from the config
+        // file stem (`cometapi.toml` → `sessions-cometapi.db`) so
+        // multiple agent configs get isolated stores by default. Bare
+        // invocations keep `sessions.db`; explicit `ACP_SESSION_DB`
+        // always wins.
         let db_path = std::env::var("ACP_SESSION_DB")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| acp_bridge::session_store::default_db_path());
+            .unwrap_or_else(|_| acp_bridge::session_store::default_db_path(config_path.as_deref()));
         match acp_bridge::session_store::SessionStore::open(&db_path) {
             Ok(s) => {
                 let keep = std::env::var("ACP_SESSION_RETENTION")
@@ -165,7 +170,29 @@ async fn main() {
         }
     };
 
-    let state = AppState::with_store(config, store);
+    // Issue #22 strict mode: `ACP_SESSION_STRICT_MODELS=1` makes
+    // session/load refuse to restore a session persisted by a
+    // different agent identity. Default is permissive (restore
+    // anything in the store).
+    let strict_models = matches!(
+        std::env::var("ACP_SESSION_STRICT_MODELS").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    );
+    let agent_identity = config_path
+        .as_ref()
+        .and_then(|p| {
+            std::path::Path::new(p)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .or_else(|| Some(config.model.clone()));
+
+    let mut state = AppState::with_store(config, store, agent_identity);
+    // Fresh Arc — no clones exist yet, so direct mutation is sound.
+    // (The protocol_version negotiation uses the same pattern later.)
+    Arc::get_mut(&mut state)
+        .expect("AppState not yet shared")
+        .strict_models = strict_models;
 
     // Spawn idle session cleanup task
     let idle_timeout = state.config.session_idle_timeout_secs;

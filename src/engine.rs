@@ -264,6 +264,16 @@ pub struct AppState {
     /// `no_persistence` rejection. Shared via `Arc` so `AppState` stays
     /// cheaply cloneable.
     pub store: Option<Arc<crate::session_store::SessionStore>>,
+    /// This agent's identity for the session store (issue #22): the
+    /// config file stem (`cometapi`), or the model name for bare
+    /// invocations. Stamped onto persisted rows; compared in
+    /// `ACP_SESSION_STRICT_MODELS` strict mode on restore. `None` only
+    /// in tests that build an AppState without one.
+    pub agent_identity: Option<String>,
+    /// Issue #22 strict mode: when set (via `main` from
+    /// `ACP_SESSION_STRICT_MODELS`), `session_restore` refuses
+    /// sessions persisted by a different `agent_identity`.
+    pub strict_models: bool,
     /// In-flight turn registry for `session/cancel` (issue #3): one
     /// entry per session with a running prompt turn. The value is the
     /// turn's generation counter plus a `watch` channel that the
@@ -304,6 +314,8 @@ impl Clone for AppState {
             config: self.config.clone(),
             protocol_version: self.protocol_version,
             store: self.store.clone(),
+            agent_identity: self.agent_identity.clone(),
+            strict_models: self.strict_models,
             turn_registry: Arc::clone(&self.turn_registry),
             pending_steers: Arc::clone(&self.pending_steers),
         }
@@ -332,13 +344,16 @@ impl AppState {
 
 impl AppState {
     pub fn new(config: LlmConfig) -> Arc<Self> {
-        Self::with_store(config, None)
+        Self::with_store(config, None, None)
     }
 
-    /// Real constructor. `store` is `Some` when persistence is enabled.
+    /// Real constructor. `store` is `Some` when persistence is enabled;
+    /// `agent_identity` is the config stem (issue #22) — stamped onto
+    /// persisted sessions and compared in strict mode.
     pub fn with_store(
         config: LlmConfig,
         store: Option<Arc<crate::session_store::SessionStore>>,
+        agent_identity: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -349,6 +364,8 @@ impl AppState {
             // AppState directly get v1 wire format without ceremony.
             protocol_version: crate::protocol::ProtocolVersion::V1,
             store,
+            agent_identity,
+            strict_models: false,
             turn_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_steers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
@@ -1329,6 +1346,7 @@ pub fn persist_session_snapshot(state: &AppState, session_id: &str) {
             created_at: now_ms(),
             updated_at: now_ms(),
             messages: session.messages.clone(),
+            agent: state.agent_identity.clone(),
         }
     };
     if let Err(e) = store.save(&record) {
@@ -1455,6 +1473,21 @@ pub fn session_restore(
         .ok_or_else(|| AcpError::UnknownSession {
             session_id: session_id.to_string(),
         })?;
+
+    // Issue #22 strict mode: refuse cross-agent restores. Rows without
+    // an agent identity (legacy v1 rows) and test AppStates without an
+    // identity stay permissive.
+    if state.strict_models {
+        if let (Some(stored), Some(current)) = (&record.agent, &state.agent_identity) {
+            if stored != current {
+                return Err(AcpError::AgentMismatch {
+                    session_id: session_id.to_string(),
+                    stored: stored.clone(),
+                    current: current.clone(),
+                });
+            }
+        }
+    }
 
     if record.cwd != request_cwd {
         return Err(AcpError::LlmError {
@@ -1877,6 +1910,73 @@ mod tests {
             state.sessions_read().get("s1").unwrap().thought_level,
             Some("max".to_string())
         );
+    }
+
+    #[test]
+    fn strict_mode_refuses_cross_agent_restore() {
+        // Issue #22: ACP_SESSION_STRICT_MODELS — a session persisted by
+        // agent 'ollama' must not restore into agent 'cometapi' in
+        // strict mode; permissive mode (default) allows it.
+        let store = crate::session_store::SessionStore::open_in_memory().unwrap();
+        let mut record = crate::session_store::SessionRecord {
+            session_id: "s_x".into(),
+            cwd: "/tmp".into(),
+            protocol_version: 1,
+            title: None,
+            created_at: 1,
+            updated_at: 1,
+            messages: vec![json!({"role": "user", "content": "hi"})],
+            agent: Some("ollama".into()),
+        };
+        store.save(&record).unwrap();
+
+        let mut cfg = cfg_with_image(false);
+        cfg.model = "comet-model".into();
+        let mut state = AppState::with_store(cfg, Some(Arc::new(store)), Some("cometapi".into()));
+
+        // Permissive (default): restores fine. Fresh Arc — get_mut is
+        // sound until the first clone.
+        Arc::get_mut(&mut state)
+            .expect("AppState not yet shared")
+            .strict_models = false;
+        session_restore(&state, false, "s_x", "/tmp", state.store.as_ref().unwrap()).unwrap();
+
+        // Strict: same-agent still fine, cross-agent refused.
+        Arc::get_mut(&mut state)
+            .expect("AppState not yet shared")
+            .strict_models = true;
+        record.session_id = "s_same".into();
+        record.agent = Some("cometapi".into());
+        state.store.as_ref().unwrap().save(&record).unwrap();
+        session_restore(
+            &state,
+            false,
+            "s_same",
+            "/tmp",
+            state.store.as_ref().unwrap(),
+        )
+        .unwrap();
+
+        let err = session_restore(&state, false, "s_x", "/tmp", state.store.as_ref().unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("persisted by agent 'ollama'"),
+            "got: {err}"
+        );
+        // A refused session must never reach memory: fresh cross-agent
+        // row, strict restore, then assert absence.
+        record.session_id = "s_never".into();
+        record.agent = Some("ollama".into());
+        state.store.as_ref().unwrap().save(&record).unwrap();
+        assert!(session_restore(
+            &state,
+            false,
+            "s_never",
+            "/tmp",
+            state.store.as_ref().unwrap()
+        )
+        .is_err());
+        assert!(state.sessions_read().get("s_never").is_none());
     }
 
     #[test]

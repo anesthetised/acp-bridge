@@ -230,6 +230,9 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `LLM_MODEL_CONTEXT` | `32768` | Model context window in tokens. Reported as `size` in `usage_update` notifications. |
 | `LLM_WEB_ALLOWLIST` | (empty) | Comma-separated host suffixes the `web_fetch` tool is allowed to reach. Empty = block all web access. |
 | `RUST_LOG` | `acp_bridge=info` | Log level (`debug`, `info`, `warn`, `error`) |
+| `ACP_SESSION_DB` | (derived) | Override the session store path. Default: `sessions-<config-stem>.db` next to the platform store (`sessions.db` for bare invocations) |
+| `ACP_SESSION_STRICT_MODELS` | `off` | `1`/`true`/`on`: `session/load` refuses sessions persisted by a different agent identity (config stem). Default: permissive — restore anything in the store |
+| `ACP_PERSISTENCE` | `on` | `off`/`false`/`0` disables the session store entirely |
 
 Also supports `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_API_KEY` as aliases.
 
@@ -405,7 +408,7 @@ the matching wire shape from the same code base.
 | `session/cancel` notification | Acknowledged with a log line. In-flight cancellation is on the roadmap. |
 | `session/end` (v1) / `session/close` (v2 baseline) | Session cleanup. Both methods share the same implementation. |
 | `session/list` (v2 baseline) | Returns active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}`. |
-| `session/load` | ✅ Restores a persisted session and replays the full timeline (user → tool_call/tool_call_update → agent) before responding. SQLite-backed, saved per tool round |
+| `session/load` | ✅ Restores a persisted session and replays the full timeline (user → tool_call/tool_call_update → agent) before responding. SQLite-backed, saved per tool round. Per-config isolation: default DB is `sessions-<config-stem>.db`, rows record the agent identity, `ACP_SESSION_STRICT_MODELS=1` refuses cross-agent restores |
 | `session/resume` | ✅ Restores without replay. Both advertise via `loadSession` / `sessionCapabilities.resume`; disable with `ACP_PERSISTENCE=off` |
 | `session/delete` (v2 optional) | Graceful `-32601 not_implemented` rejection. Use `session/close` instead. |
 | `session/set_mode` | Graceful `-32602 no_modes` rejection. `session/new` does not return a `modes` array. |

@@ -25,6 +25,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Per-config session store isolation** — the default database
+  filename now derives from the config file stem
+  (`cometapi.toml` → `sessions-cometapi.db`), so multiple agent
+  configs get isolated stores by default; bare invocations keep
+  `sessions.db` and an explicit `ACP_SESSION_DB` always wins (issue
+  #22). Persisted rows record the producing agent's identity (new
+  `agent` column, `user_version = 2` migration — existing v1 rows are
+  preserved and read back without an identity), and `list()` exposes
+  it. Opt-in strict mode (`ACP_SESSION_STRICT_MODELS=1`) makes
+  `session/load` refuse to restore a session persisted by a different
+  agent identity; the default stays permissive.
+
 - **Per-session thought levels via `session/set_config_option`** —
   opt-in (`[llm] thought_levels = ["low", "high", "max"]` or
   `LLM_THOUGHT_LEVELS` env): `session/new` advertises a `thought_level`
