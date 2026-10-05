@@ -813,13 +813,14 @@ async fn handle_acp_prompt(
                             &args,
                         )
                     }
-                    Some(Notification::ToolDone { id, status, result, .. }) => {
+                    Some(Notification::ToolDone { id, status, result, diff, .. }) => {
                         acp::notify_tool_done_for(
                             state.protocol_version,
                             &session_id,
                             &id,
                             &status,
                             result.as_deref(),
+                            diff.as_ref(),
                         )
                     }
                     Some(Notification::TextChunk(text)) => {
@@ -858,13 +859,14 @@ async fn handle_acp_prompt(
                                     &args,
                                 )
                             }
-                            Notification::ToolDone { id, status, result, .. } => {
+                            Notification::ToolDone { id, status, result, diff, .. } => {
                                 acp::notify_tool_done_for(
                                     state.protocol_version,
                                     &session_id,
                                     &id,
                                     &status,
                                     result.as_deref(),
+                                    diff.as_ref(),
                                 )
                             }
                             Notification::TextChunk(text) => {

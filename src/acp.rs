@@ -197,21 +197,48 @@ pub fn notify_tool_start(session_id: &str, tool_call_id: &str, name: &str, args:
 /// `tool_call_id` is required. `status` is one of `pending | in_progress |
 /// completed | failed`. Spec-compliant clients ignore notifications whose
 /// toolCallId they have not seen.
-pub fn notify_tool_done(session_id: &str, tool_call_id: &str, status: &str, result: Option<&str>) {
+pub fn notify_tool_done(
+    session_id: &str,
+    tool_call_id: &str,
+    status: &str,
+    result: Option<&str>,
+    diff: Option<&crate::tools::ToolDiff>,
+) {
     let mut body = json!({
         "sessionUpdate": "tool_call_update",
         "toolCallId": tool_call_id,
         "status": status
     });
+    let mut content: Vec<Value> = Vec::new();
     if let Some(result) = result {
         if !result.is_empty() {
             let text = preview_result(result);
-            body["content"] = json!([{
+            content.push(json!({
                 "type": "content",
                 "content": {"type": "text", "text": text}
-            }]);
+            }));
             body["rawOutput"] = json!(text);
         }
+    }
+    if let Some(d) = diff {
+        // Issue #26: file mutations carry a spec diff content block so
+        // Clients render a real diff instead of "No diff available".
+        // Size-capped: a diff too large for display is dropped rather
+        // than truncated (a partial old/new pair would render as a
+        // misleading change); the text block + rawOutput still carry
+        // the result.
+        let size = d.old_text.as_deref().map(str::len).unwrap_or(0) + d.new_text.len();
+        if size <= TOOL_RESULT_MAX {
+            content.push(json!({
+                "type": "diff",
+                "path": d.path,
+                "oldText": d.old_text,
+                "newText": d.new_text
+            }));
+        }
+    }
+    if !content.is_empty() {
+        body["content"] = Value::Array(content);
     }
     send_session_update(session_id, body);
 }
@@ -513,7 +540,9 @@ pub fn notify_replay_event(
             notify_tool_start_for(version, session_id, id, name, args);
         }
         ReplayEvent::ToolResult { id, result } => {
-            notify_tool_done_for(version, session_id, id, "completed", Some(result));
+            // Replayed history has no before/after capture — diffs only
+            // exist for live in-turn tool executions (issue #26).
+            notify_tool_done_for(version, session_id, id, "completed", Some(result), None);
         }
     }
 }
@@ -527,10 +556,11 @@ pub fn notify_tool_done_for(
     tool_call_id: &str,
     status: &str,
     result: Option<&str>,
+    diff: Option<&crate::tools::ToolDiff>,
 ) {
     match version {
-        ProtocolVersion::V2 => notify_tool_done(session_id, tool_call_id, status, result),
-        _ => notify_tool_done(session_id, tool_call_id, status, result),
+        ProtocolVersion::V2 => notify_tool_done(session_id, tool_call_id, status, result, diff),
+        _ => notify_tool_done(session_id, tool_call_id, status, result, diff),
     }
 }
 

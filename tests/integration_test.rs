@@ -1918,8 +1918,8 @@ async fn test_tool_sandbox_prevents_escape() {
         &json!({"path": "../../etc/passwd"}),
     );
     assert!(
-        result.contains("Error") || result.contains("outside"),
-        "Should reject path traversal, got: {result}"
+        result.text.contains("Error") || result.text.contains("outside"),
+        "Should reject path traversal, got: {result:?}"
     );
 }
 
@@ -1933,7 +1933,7 @@ async fn test_tool_read_file() {
     std::fs::write(dir.join("test.txt"), "hello from test file").unwrap();
 
     let result = tools::execute_tool(&dir, "read_file", &json!({"path": "test.txt"}));
-    assert_eq!(result, "hello from test file");
+    assert_eq!(result.text, "hello from test file");
 
     // Cleanup
     std::fs::remove_dir_all(&dir).ok();
@@ -1953,8 +1953,8 @@ async fn test_tool_search_code() {
 
     let result = tools::execute_tool(&dir, "search_code", &json!({"pattern": "println"}));
     assert!(
-        result.contains("main.rs") && result.contains("println"),
-        "Should find pattern in file, got: {result}"
+        result.text.contains("main.rs") && result.text.contains("println"),
+        "Should find pattern in file, got: {result:?}"
     );
 
     // Cleanup
@@ -1967,11 +1967,237 @@ async fn test_tool_unknown() {
     use std::path::Path;
 
     let result = tools::execute_tool(Path::new("/tmp"), "hack_the_planet", &json!({}));
-    assert!(result.contains("Unknown tool"));
+    assert!(result.text.contains("Unknown tool"));
 }
 
 // ----------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_edit_completion_carries_diff_content_block() {
+    // Issue #26: file-mutating tool completions carry a spec `diff`
+    // content block (path / oldText / newText) so Clients render a real
+    // diff instead of "No diff available".
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = std::env::temp_dir().join(format!(
+        "acp-bridge-diff-edit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("diffed.txt"), "alpha beta gamma\n").unwrap();
+
+    let call_count = std::sync::Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(move |req: Request<Body>| {
+                let count = call_count.clone();
+                async move {
+                    let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                    let has_tool_result = body["messages"]
+                        .as_array()
+                        .map(|msgs| msgs.iter().any(|m| m["role"] == "tool"))
+                        .unwrap_or(false);
+                    let _ = count.fetch_add(1, Ordering::SeqCst);
+                    if has_tool_result {
+                        axum::Json(json!({
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "edited"},
+                                "finish_reason": "stop"
+                            }]
+                        }))
+                        .into_response()
+                    } else {
+                        axum::Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": "call_diff",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "edit",
+                                            "arguments": "{\"path\": \"diffed.txt\", \"old_text\": \"beta\", \"new_text\": \"BETA\"}"
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd": dir.to_str().unwrap()}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"edit the file"}]}
+    }));
+    let (notifications, _response) = h.read_until_response(2);
+
+    // The completion update for the edit must carry the diff block.
+    let completed: Vec<&Value> = notifications
+        .iter()
+        .filter(|m| {
+            let u = &m["params"]["update"];
+            u["sessionUpdate"] == "tool_call_update" && u["status"] == "completed"
+        })
+        .collect();
+    assert!(
+        !completed.is_empty(),
+        "Expected a completed tool_call_update, got: {notifications:?}"
+    );
+    let with_diff = completed.iter().any(|m| {
+        let u = &m["params"]["update"];
+        let content = u["content"].as_array();
+        content.is_some_and(|blocks| {
+            blocks.iter().any(|b| {
+                b["type"] == "diff"
+                    && b["path"].as_str().unwrap_or("").ends_with("diffed.txt")
+                    && b["oldText"] == "beta"
+                    && b["newText"] == "BETA"
+            })
+        })
+    });
+    assert!(
+        with_diff,
+        "edit completion must carry a diff content block with path/oldText/newText, got: {:?}",
+        completed
+    );
+
+    h.shutdown();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_write_file_new_file_diff_old_text_null() {
+    // Issue #26: writing a NEW file emits `oldText: null` in the diff
+    // block — Clients render it as an all-additions diff.
+    let dir = std::env::temp_dir().join(format!(
+        "acp-bridge-diff-write-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(|req: Request<Body>| async move {
+                let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                let has_tool_result = body["messages"]
+                    .as_array()
+                    .map(|msgs| msgs.iter().any(|m| m["role"] == "tool"))
+                    .unwrap_or(false);
+                if has_tool_result {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "wrote it"},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                    .into_response()
+                } else {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_wdiff",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "write_file",
+                                        "arguments": "{\"path\": \"fresh.txt\", \"content\": \"hello\"}"
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd": dir.to_str().unwrap()}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"write the file"}]}
+    }));
+    let (notifications, _response) = h.read_until_response(2);
+
+    let completed: Vec<&Value> = notifications
+        .iter()
+        .filter(|m| {
+            let u = &m["params"]["update"];
+            u["sessionUpdate"] == "tool_call_update" && u["status"] == "completed"
+        })
+        .collect();
+    let with_diff = completed.iter().any(|m| {
+        let u = &m["params"]["update"];
+        u["content"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|b| {
+                b["type"] == "diff"
+                    && b["path"].as_str().unwrap_or("").ends_with("fresh.txt")
+                    && b["oldText"].is_null()
+                    && b["newText"] == "hello"
+            })
+        })
+    });
+    assert!(
+        with_diff,
+        "new-file write must emit a diff block with oldText: null, got: {:?}",
+        completed
+    );
+
+    h.shutdown();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ACP v1 wire-format conformance regression tests (issue #13 follow-up + survey
+
 // of Meuxe / ACP UI / Casper / Gold Band / Codeg / DeepChat).
 // ----------------------------------------------------------------------------
 
