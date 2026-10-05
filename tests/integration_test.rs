@@ -2328,6 +2328,13 @@ async fn test_sigterm_exits_gracefully() {
     tokio::spawn(async move {
         axum::serve(listener, mock_llm_router()).await.unwrap();
     });
+    // Keep persistence on (realistic startup path) but pointed at a
+    // throwaway store — see the spawn env below.
+    let temp_db_path = std::env::temp_dir().join(format!(
+        "acp_sigterm_db_{}_{:?}.db",
+        std::process::id(),
+        std::thread::current().id()
+    ));
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acp-bridge"));
     let stderr_file = std::fs::File::create(std::env::temp_dir().join("acp_sigterm_test.log"))
@@ -2338,6 +2345,11 @@ async fn test_sigterm_exits_gracefully() {
         .env("LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
         .env("LLM_MODEL", "test-model")
         .env("LLM_API_KEY", "test-key")
+        // Isolation (learned the hard way): without this the spawn
+        // opens the user's REAL session store — this was the only
+        // test binary spawn without a DB override, and it stamped
+        // test sessions into the production database.
+        .env("ACP_SESSION_DB", temp_db_path.display().to_string())
         .env("RUST_LOG", "acp_bridge=debug");
     let mut child = cmd.spawn().expect("Failed to spawn acp-bridge");
 
