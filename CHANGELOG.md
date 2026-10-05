@@ -25,6 +25,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **`diff` content blocks on file-mutating tool completions** — `edit`
+  and `write_file` completions now append an ACP spec `diff` block
+  (`{type: "diff", path, oldText, newText}`) to the `tool_call_update`
+  `content` array, so Clients render a real diff instead of
+  "No diff available" (field report: "Edited prepare.py — No diff
+  available"). `edit` diffs are snippet-based (the matched
+  `old_text` → `new_text`, with the absolute resolved path from #16);
+  `write_file` diffs are whole-file — `oldText: null` for new files,
+  the previous content (read **before** the mutation) for overwrites.
+  Size-capped at `TOOL_RESULT_MAX`: an oversized or non-capturable
+  change (binary file) emits the text block only — a truncated
+  old/new pair would render a misleading diff. Raw output and the
+  model-visible result text are unchanged; the diff is purely additive
+  Client UI metadata. v1 and v2 wires both emit it. (#26)
+
 - **Session persistence with `session/load` / `session/resume`** —
   sessions now survive agent restarts (binary updates, crashes,
   supervisor respawns). Storage is SQLite via `rusqlite` (bundled — the

@@ -224,6 +224,10 @@ pub enum Notification {
         /// block on the completion update (issue #14). `None` for
         /// pseudo-tools with nothing to show.
         result: Option<String>,
+        /// Before/after capture from file-mutating tools (issue #26) —
+        /// emitted as an ACP `diff` content block so Clients can render
+        /// the change. `None` for everything else.
+        diff: Option<crate::tools::ToolDiff>,
     },
     TextChunk(String),
 }
@@ -849,12 +853,12 @@ pub async fn session_prompt(
                 name: name.into(),
                 args: args.clone(),
             });
-            let result = tools::execute_tool(&working_dir, name, &args);
+            let outcome = tools::execute_tool(&working_dir, name, &args);
             // Tool failures are signaled by the "Error" prefix of the
             // result text (see tools.rs) — surface them as a real
             // `failed` status instead of unconditional `completed`
             // (issue #14).
-            let status = if result.starts_with("Error") {
+            let status = if outcome.text.starts_with("Error") {
                 "failed"
             } else {
                 "completed"
@@ -863,17 +867,22 @@ pub async fn session_prompt(
                 id: tool_call_id.to_string(),
                 name: name.into(),
                 status: status.into(),
-                result: Some(result.clone()),
+                result: Some(outcome.text.clone()),
+                diff: outcome.diff,
             });
 
-            debug!(tool = name, result_len = result.len(), "Tool executed");
+            debug!(
+                tool = name,
+                result_len = outcome.text.len(),
+                "Tool executed"
+            );
 
             {
                 let mut sessions = state.sessions_write();
                 if let Some(session) = sessions.get_mut(session_id) {
                     session
                         .messages
-                        .push(backend.format_tool_result(tool_call_id, &result));
+                        .push(backend.format_tool_result(tool_call_id, &outcome.text));
                 }
             }
 
@@ -1537,6 +1546,7 @@ mod tests {
             name: "read_file".into(),
             status: "completed".into(),
             result: Some("file contents".into()),
+            diff: None,
         };
         match n {
             Notification::ToolDone {
@@ -1544,6 +1554,7 @@ mod tests {
                 name,
                 status,
                 result,
+                ..
             } => {
                 assert_eq!(id, "tc_42");
                 assert_eq!(name, "read_file");
