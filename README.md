@@ -243,6 +243,18 @@ cp config.toml.example config.toml
 
 See [config.toml.example](config.toml.example) for all options.
 
+#### Backend request overrides
+
+For backend knobs acp-bridge does not model natively (`reasoning_effort`, `top_p`, `verbosity`, vendor flags…), merge arbitrary fields into the top level of every request body:
+
+```toml
+[llm.request_overrides]
+reasoning_effort = "max"
+top_p = 0.95
+```
+
+Overrides are applied **last** (they win over built-in `temperature` / `max_tokens`); reserved engine-owned keys (`model`, `messages`, `stream`, `tools`) are ignored with a warning; Ollama-native bodies get the same top-level merge only (override `options` as a whole object if needed).
+
 ## Mac quick start (Apple Silicon)
 
 Mac with Apple Silicon is ideal for local AI — unified memory means your entire RAM is available as VRAM.

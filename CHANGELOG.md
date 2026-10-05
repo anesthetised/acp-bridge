@@ -25,6 +25,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Backend request overrides (`[llm.request_overrides]`)** — arbitrary
+  passthrough fields merged into the top level of every upstream
+  request body, for knobs acp-bridge will never enumerate fast enough:
+  `reasoning_effort`, `top_p`, `verbosity`, `service_tier`, vendor
+  flags. Applied **last**, so overrides win over the built-in
+  `temperature` / `max_tokens` — that is the point of an override.
+  Reserved engine-owned keys (`model`, `messages`, `stream`, `tools`)
+  are ignored with a warning (silently allowing them would corrupt the
+  wire protocol). Top-level merge for both backend families; Ollama
+  users can override `options` as a whole object (no deep merge by
+  design). Config-file only — structural passthrough, not a secret, so
+  no env var. (Issue #2: a user who wanted GLM-5.3's
+  `reasoning_effort: "max"` needed a proxy or a source patch.)
+
 - **Steering: mid-turn prompts inject at tool-round boundaries** — a
   `session/prompt` sent while a turn is running is no longer rejected
   with `turn_in_progress`. It is queued and injected as a real `user`

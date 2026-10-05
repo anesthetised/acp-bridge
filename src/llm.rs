@@ -353,6 +353,14 @@ pub struct LlmConfig {
     /// still display the percentage used.
     /// Override via `LLM_MODEL_CONTEXT` env var; defaults to 32768.
     pub context_size: u64,
+    /// Arbitrary passthrough fields merged into the TOP LEVEL of every
+    /// upstream request body after `build_body()` finishes (issue #2).
+    /// Applied last — overrides win over built-in sampling fields
+    /// (`temperature`, `max_tokens`). Reserved engine-owned keys
+    /// (`model`, `messages`, `stream`, `tools`) are ignored with a
+    /// warning. Configured via `[llm.request_overrides]` in the TOML
+    /// config; no env var (structural config, not a secret).
+    pub request_overrides: serde_json::Map<String, Value>,
     /// Shared HTTP client for connection pooling.
     pub client: Client,
 }
@@ -439,6 +447,7 @@ impl LlmConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32768),
+            request_overrides: serde_json::Map::new(),
             client,
         }
     }
@@ -767,6 +776,26 @@ fn build_body(
         if let Some(max) = config.max_tokens {
             body["max_tokens"] = json!(max);
         }
+    }
+
+    // Request overrides (issue #2): merged LAST so they win over the
+    // built-in sampling fields — that is the point of an override.
+    // Top-level merge only, for BOTH backend families: Ollama-native
+    // users can override `options` as a whole object if needed, but
+    // there is deliberately no options-deep merge. Reserved keys are
+    // engine-owned per-round (`model`, `messages`, `stream`, `tools`);
+    // silently allowing them would corrupt the wire protocol, so they
+    // are ignored with a warning instead.
+    const RESERVED_KEYS: [&str; 4] = ["model", "messages", "stream", "tools"];
+    for (key, value) in &config.request_overrides {
+        if RESERVED_KEYS.contains(&key.as_str()) {
+            warn!(
+                key = %key,
+                "request_overrides: reserved key ignored (engine-owned per-round)"
+            );
+            continue;
+        }
+        body[key.as_str()] = value.clone();
     }
     body
 }
@@ -1281,6 +1310,7 @@ mod tests {
             session_idle_timeout_secs: 0,
             prompt_supports_image: false,
             context_size: 32768,
+            request_overrides: serde_json::Map::new(),
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
@@ -1400,6 +1430,89 @@ mod tests {
         let body = build_body(&cfg, &[], "m", false, Some(&tools));
         assert_eq!(body["max_tokens"], json!(256));
         assert_eq!(body["tools"], json!(tools));
+    }
+
+    // -- request_overrides (issue #2) ---------------------------------------
+
+    #[test]
+    fn request_overrides_merge_top_level() {
+        let mut cfg = test_config("http://host/v1");
+        cfg.request_overrides
+            .insert("reasoning_effort".into(), json!("max"));
+        cfg.request_overrides.insert("top_p".into(), json!(0.95));
+        let body = build_body(&cfg, &[], "m", false, None);
+        assert_eq!(body["reasoning_effort"], "max");
+        assert_eq!(body["top_p"], json!(0.95));
+        // Nested objects/bools serialize fine.
+        cfg.request_overrides
+            .insert("extra".into(), json!({"nested": true, "n": 3}));
+        let body = build_body(&cfg, &[], "m", false, None);
+        assert_eq!(body["extra"], json!({"nested": true, "n": 3}));
+    }
+
+    #[test]
+    fn request_overrides_win_over_builtin_sampling_fields() {
+        // Overrides are the point: they beat temperature/max_tokens.
+        let mut cfg = test_config("http://host/v1");
+        cfg.temperature = Some(0.5);
+        cfg.max_tokens = Some(256);
+        cfg.request_overrides
+            .insert("temperature".into(), json!(1.0));
+        cfg.request_overrides
+            .insert("max_tokens".into(), json!(4096));
+        let body = build_body(&cfg, &[], "m", false, None);
+        assert_eq!(body["temperature"], json!(1.0));
+        assert_eq!(body["max_tokens"], json!(4096));
+    }
+
+    #[test]
+    fn request_overrides_reserved_keys_ignored() {
+        // model/messages/stream/tools are engine-owned per-round; silently
+        // applying them would corrupt the wire protocol.
+        let mut cfg = test_config("http://host/v1");
+        cfg.request_overrides.insert("model".into(), json!("evil"));
+        cfg.request_overrides.insert("messages".into(), json!([]));
+        cfg.request_overrides.insert("stream".into(), json!(true));
+        cfg.request_overrides.insert("tools".into(), json!([]));
+        let body = build_body(
+            &cfg,
+            &[json!({"role": "user", "content": "hi"})],
+            "real-model",
+            false,
+            None,
+        );
+        assert_eq!(body["model"], "real-model");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["messages"], json!([{"role": "user", "content": "hi"}]));
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn request_overrides_work_for_ollama_native_top_level_only() {
+        // Ollama-native gets the same TOP-LEVEL merge; no options-deep
+        // merge by design. `options` itself is overridable as a whole.
+        let mut cfg = test_config("http://host:11434");
+        cfg.temperature = Some(0.4);
+        cfg.request_overrides.insert("top_p".into(), json!(0.95));
+        let body = build_body(&cfg, &[], "m", false, None);
+        assert_eq!(body["options"]["temperature"], json!(0.4));
+        assert_eq!(body["top_p"], json!(0.95));
+
+        cfg.request_overrides
+            .insert("options".into(), json!({"num_predict": 10}));
+        let body = build_body(&cfg, &[], "m", false, None);
+        // Override replaced the whole options object — documented shape.
+        assert_eq!(body["options"], json!({"num_predict": 10}));
+    }
+
+    #[test]
+    fn request_overrides_empty_leaves_body_unchanged() {
+        let mut cfg = test_config("http://host/v1");
+        cfg.request_overrides.insert("x".into(), json!(1));
+        cfg.request_overrides.clear();
+        let body = build_body(&cfg, &[], "m", false, None);
+        assert_eq!(body["model"], "m");
+        assert_eq!(body.as_object().unwrap().len(), 3); // model, messages, stream
     }
 
     // -- probe_backend ------------------------------------------------------

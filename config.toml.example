@@ -34,6 +34,18 @@ max_history_turns = 50
 # Strong agentic models may need more than the older default of 5.
 max_tool_rounds = 25
 
+# Arbitrary passthrough fields merged into the TOP LEVEL of every request
+# body sent to the backend (issue #2) — for knobs acp-bridge does not
+# model natively: reasoning_effort, top_p, verbosity, vendor flags…
+# Applied LAST, so these win over temperature / max_tokens above.
+# Reserved engine-owned keys (model, messages, stream, tools) are
+# ignored with a warning. Ollama-native: top-level merge only —
+# override `options` as a whole object if needed (no deep merge).
+#
+# [llm.request_overrides]
+# reasoning_effort = "max"
+# top_p = 0.95
+
 # ---------------------------------------------------------------------------
 # Client mode — spawn an external ACP agent (used with --client flag)
 # ---------------------------------------------------------------------------
