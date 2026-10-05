@@ -1139,6 +1139,7 @@ pub async fn session_prompt(
                 kind = e.kind.as_str(),
                 status = ?e.status,
                 retryable,
+                detail = %e.message,
                 "LLM communication failed"
             );
             break;
