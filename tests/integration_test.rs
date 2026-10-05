@@ -2967,6 +2967,113 @@ async fn test_usage_update_prefers_backend_reported_tokens() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #40: per-session model selection — bb's model picker
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_session_model_selection_flow() {
+    // End-to-end: the startup probe's list is advertised → picking a
+    // different model via set_config_option is accepted → the next
+    // round's request body carries model: <pick> (mock asserts the
+    // body). Zero configuration needed — no thought_levels required.
+    let models_json = json!({"data": [
+        {"id": "test-model", "object": "model"},
+        {"id": "claude-mock", "object": "model"}
+    ]});
+    let router = Router::new()
+        .route(
+            "/v1/models",
+            get(move || async move { axum::Json(models_json.clone()) }),
+        )
+        // No /api/tags route: the startup probe must fall through to
+        // /v1/models (the OpenAI-compatible path, like cometapi).
+        .route(
+            "/v1/chat/completions",
+            post(|req: Request<Body>| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                let model = body["model"].as_str().unwrap_or("");
+                if model == "claude-mock" {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "MODEL_SWITCH seen"},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                    .into_response()
+                } else {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_wait",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{\"path\": \".\"}"}
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+    let mut h = TestHarness::start_with_router(router).await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // session/new advertises BOTH backend models, configured default.
+    let model_option = &resp["result"]["configOptions"][0];
+    assert_eq!(model_option["id"], "model");
+    assert_eq!(model_option["currentValue"], "test-model");
+    let values: Vec<&str> = model_option["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert!(
+        values.contains(&"claude-mock"),
+        "backend list must be advertised, got: {values:?}"
+    );
+
+    // Switch the model; the response echoes the updated option.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/set_config_option",
+        "params":{"sessionId":&sid,"configId":"model","value":"claude-mock"}
+    }));
+    let (_, set_resp) = h.read_until_response(2);
+    assert_eq!(
+        set_resp["result"]["configOptions"][0]["currentValue"], "claude-mock",
+        "model switch must be accepted and echoed, got: {set_resp:?}"
+    );
+
+    // The next turn's request body carries the picked model.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":3,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"work"}]}
+    }));
+    let (_, turn_response) = h.read_until_response(3);
+    assert!(
+        turn_response["result"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("MODEL_SWITCH"),
+        "model must be claude-mock, got: {turn_response:?}"
+    );
+
+    h.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // Issue #13: thought-level config options — bb's dynamic-config surface
 // ---------------------------------------------------------------------------
 

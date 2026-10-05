@@ -346,6 +346,12 @@ pub struct LlmConfig {
     /// `promptCapabilities.image` to Clients at `initialize` time. Defaults
     /// to `false`; set `LLM_SUPPORTS_IMAGE=true` to opt in.
     pub prompt_supports_image: bool,
+    /// Models the backend reported at startup (issue #40): the
+    /// startup probe's `/api/tags` or `/v1/models` result, cached so
+    /// the `model` config option can advertise the real list to
+    /// Clients. The configured model is always prepended if missing.
+    /// Empty = fetch failed; the single configured model is advertised.
+    pub available_models: Vec<String>,
     /// Model context window in tokens. Used to report `size` in
     /// `usage_update` notifications. acp-bridge does its own
     /// char-based estimate for `used` because most local backends do
@@ -414,6 +420,8 @@ impl LlmConfig {
             .expect("Failed to create HTTP client");
 
         Self {
+            // Issue #40: filled by main after the startup probe.
+            available_models: Vec::new(),
             base_url: std::env::var("LLM_BASE_URL")
                 .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
                 .unwrap_or_else(|_| "http://localhost:11434/v1".into()),
@@ -1419,6 +1427,7 @@ mod tests {
             session_idle_timeout_secs: 0,
             prompt_supports_image: false,
             context_size: 32768,
+            available_models: Vec::new(),
             thought_levels: Vec::new(),
             request_overrides: serde_json::Map::new(),
             client: Client::builder()

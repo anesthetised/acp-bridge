@@ -25,6 +25,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Per-session model selection (bb's model picker)** — the startup
+  probe's model list (`/api/tags` for Ollama, `/v1/models` for
+  OpenAI-compatible) is now kept and advertised as the `model` config
+  option, so Clients can switch models per session with zero
+  configuration. `session/set_config_option(configId: "model")`
+  accepts any advertised model and every subsequent round's request
+  body carries it (issue #40 — previously the switch was silently
+  rejected and requests kept using the configured model). The
+  configured model remains the default and is always offered; probe
+  failure degrades to the single configured model. The choice is
+  in-memory per session.
+
 - **Per-config session store isolation** — the default database
   filename now derives from the config file stem
   (`cometapi.toml` → `sessions-cometapi.db`), so multiple agent

@@ -100,6 +100,12 @@ pub struct Session {
     /// to the config default on `session/load` after a restart (pinned
     /// decision on #13).
     pub thought_level: Option<String>,
+    /// Per-session model override (issue #40): set by
+    /// `session/set_config_option(configId: "model")` from the
+    /// Client's model picker, applied to every round's request body
+    /// via the existing `model_override` plumbing. In-memory only,
+    /// same policy as `thought_level`.
+    pub model_override: Option<String>,
 }
 
 impl Session {
@@ -114,6 +120,7 @@ impl Session {
             working_dir,
             protocol_version,
             thought_level: None,
+            model_override: None,
         }
     }
 
