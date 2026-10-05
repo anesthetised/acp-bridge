@@ -47,11 +47,14 @@ max_tool_rounds = 25
 # top_p = 0.95
 
 # Reasoning-effort levels advertised to Clients as a `thought_level`
-# config option (issue #13, bb's reasoning-effort picker). Opt-in:
-# omit (or leave empty) and the thought-level picker is not advertised.
-# (`session/new` always advertises the `model` option listing the
-# backend's models — issue #40, no config needed.) Selecting a level
-# in the Client UI sends session/set_config_option; every subsequent
+# config option (issue #13, bb's reasoning-effort picker). Defaults
+# to ["low", "medium", "high", "max"] on OpenAI-compatible backends
+# (nothing on Ollama-native) when unset — set explicitly to override,
+# or to [] to force the picker off. (`session/new` always advertises
+# the `model` option listing the backend's models — issue #40, no
+# config needed.) Only bb's known level names render in its picker:
+# none, minimal, low, medium, high, xhigh, ultracode, max, ultra.
+# Selecting a level sends session/set_config_option; every subsequent
 # round's body carries reasoning_effort: <level> for that session
 # (beats the request_overrides default above). In-memory per session.
 #

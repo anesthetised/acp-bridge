@@ -361,13 +361,22 @@ pub struct LlmConfig {
     pub context_size: u64,
     /// Opt-in reasoning-effort levels advertised to ACP Clients as a
     /// `thought_level` config option (issue #13, re-scoped to bb's
-    /// `configOptions` surface). Empty = feature off (no picker, no
-    /// wire change). Each level maps to a top-level `reasoning_effort`
-    /// field in upstream request bodies via `session/set_config_option`
-    /// (bb's picker sends `none|low|medium|high|xhigh|ultracode|max|ultra`).
-    /// Config: `[llm] thought_levels = [...]`; env: `LLM_THOUGHT_LEVELS`
-    /// (comma-separated; env wins over config).
+    /// `configOptions` surface). Empty = the safe default (issue #13
+    /// discussion): `["low", "medium", "high", "max"]` for
+    /// OpenAI-compatible backends, nothing for Ollama-native (which
+    /// has no `reasoning_effort` parameter). Each level maps to a
+    /// top-level `reasoning_effort` field in upstream request bodies
+    /// via `session/set_config_option` (bb's picker renders only its
+    /// known set: `none|minimal|low|medium|high|xhigh|ultracode|max|ultra`
+    /// — unknown values are dropped from the picker, so custom levels
+    /// beyond these are pointless). Config: `[llm] thought_levels =
+    /// [...]`; env: `LLM_THOUGHT_LEVELS` (comma-separated; env wins
+    /// over config). Set to `[]` explicitly in TOML to force the
+    /// picker off.
     pub thought_levels: Vec<String>,
+    /// Distinguishes "user left thought_levels unset" (apply the
+    /// safe default) from "user set it to []" (force off).
+    pub thought_levels_set: bool,
     /// Arbitrary passthrough fields merged into the TOP LEVEL of every
     /// upstream request body after `build_body()` finishes (issue #2).
     /// Applied last — overrides win over built-in sampling fields
@@ -464,6 +473,7 @@ impl LlmConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32768),
+            thought_levels_set: true,
             thought_levels: std::env::var("LLM_THOUGHT_LEVELS")
                 .ok()
                 .map(|v| {
@@ -1429,6 +1439,7 @@ mod tests {
             context_size: 32768,
             available_models: Vec::new(),
             thought_levels: Vec::new(),
+            thought_levels_set: false,
             request_overrides: serde_json::Map::new(),
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
