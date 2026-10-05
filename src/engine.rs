@@ -253,7 +253,16 @@ pub struct AppState {
     /// `no_persistence` rejection. Shared via `Arc` so `AppState` stays
     /// cheaply cloneable.
     pub store: Option<Arc<crate::session_store::SessionStore>>,
+    /// In-flight turn registry for `session/cancel` (issue #3): one
+    /// entry per session with a running prompt turn. The value is the
+    /// turn's generation counter plus a `watch` channel that the
+    /// cancel handler flips; the turn's response task selects on it.
+    /// Turns are keyed by session — a session runs at most one turn.
+    pub turn_registry: Arc<std::sync::Mutex<HashMap<String, TurnEntry>>>,
 }
+
+/// One in-flight turn: generation counter + cancel flag (issue #3).
+pub type TurnEntry = (u64, tokio::sync::watch::Sender<bool>);
 
 impl Clone for AppState {
     fn clone(&self) -> Self {
@@ -262,6 +271,7 @@ impl Clone for AppState {
             config: self.config.clone(),
             protocol_version: self.protocol_version,
             store: self.store.clone(),
+            turn_registry: Arc::clone(&self.turn_registry),
         }
     }
 }
@@ -285,6 +295,7 @@ impl AppState {
             // AppState directly get v1 wire format without ceremony.
             protocol_version: crate::protocol::ProtocolVersion::V1,
             store,
+            turn_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -660,42 +671,79 @@ pub async fn session_prompt(
         };
 
         let backend = state.config.backend();
-        let (mut rx, mut round_error) =
-            match llm::chat_streamed(&state.config, &messages, None, Some(&tool_defs)).await {
-                Ok(rx) => (Some(rx), None),
-                Err(e) => (None, Some(e)),
-            };
-
-        // Drain this round's stream. Parsers guarantee Thinking before
-        // Content before ToolCall and exactly one terminal event (Error
-        // or Done). Reasoning and text are notified as they arrive — the
-        // point of the streaming loop (issue #11) — while the accumulated
-        // forms feed the session history and the turn result.
-        let mut reasoning = String::new();
+        // Open + drain the round's stream, with one bounded silent retry
+        // when the round fails before notifying anything (issue #15).
+        // Once a chunk has reached the Client, fail fast instead — a
+        // retry would re-generate and duplicate already-visible output.
+        let mut notified_any = false;
         let mut content = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
-        if let Some(rx) = rx.as_mut() {
-            while let Some(chunk) = rx.recv().await {
-                match chunk {
-                    llm::StreamChunk::Thinking(t) => {
-                        reasoning.push_str(&t);
-                        notify(Notification::ThinkingText { text: t });
+        let mut round_error: Option<crate::llm::LlmError> = None;
+        for attempt in 0..2 {
+            // The receiver is loop-local: once the round's stream ends
+            // (normally or by error) it has no further use.
+            let (mut rx, round_err) =
+                match llm::chat_streamed(&state.config, &messages, None, Some(&tool_defs)).await {
+                    Ok(rx) => (Some(rx), None),
+                    Err(e) => (None, Some(e)),
+                };
+            round_error = round_err;
+            if round_error.is_some() {
+                break;
+            }
+
+            // Drain this round's stream. Parsers guarantee Thinking
+            // before Content before ToolCall and exactly one terminal
+            // event (Error or Done). Reasoning and text are notified as
+            // they arrive — the point of the streaming loop (issue #11)
+            // — while the accumulated forms feed the session history and
+            // the turn result.
+            if let Some(rx) = rx.as_mut() {
+                while let Some(chunk) = rx.recv().await {
+                    match chunk {
+                        llm::StreamChunk::Thinking(t) => {
+                            notified_any = true;
+                            notify(Notification::ThinkingText { text: t });
+                        }
+                        llm::StreamChunk::Content(t) => {
+                            notified_any = true;
+                            content.push_str(&t);
+                            notify(Notification::TextChunk(t));
+                        }
+                        llm::StreamChunk::ToolCall(call) => {
+                            notified_any = true;
+                            tool_calls.push(call)
+                        }
+                        llm::StreamChunk::Error(message, kind) => {
+                            round_error = Some(crate::llm::LlmError {
+                                kind,
+                                message,
+                                status: None,
+                            });
+                        }
+                        llm::StreamChunk::Done => break,
                     }
-                    llm::StreamChunk::Content(t) => {
-                        content.push_str(&t);
-                        notify(Notification::TextChunk(t));
-                    }
-                    llm::StreamChunk::ToolCall(call) => tool_calls.push(call),
-                    llm::StreamChunk::Error(message, kind) => {
-                        round_error = Some(crate::llm::LlmError {
-                            kind,
-                            message,
-                            status: None,
-                        });
-                    }
-                    llm::StreamChunk::Done => break,
                 }
             }
+
+            if round_error.is_some() {
+                if attempt == 0 && !notified_any {
+                    // Nothing reached the Client — a single silent retry
+                    // is invisible and strictly better than killing a
+                    // long turn (issue #15). Reset accumulators.
+                    warn!(
+                        attempt,
+                        kind = round_error.as_ref().unwrap().kind.as_str(),
+                        "Round failed before notifying anything; retrying once"
+                    );
+                    notified_any = false;
+                    content.clear();
+                    tool_calls.clear();
+                    continue;
+                }
+                break;
+            }
+            break;
         }
 
         if let Some(e) = round_error {

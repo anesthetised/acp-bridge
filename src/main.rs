@@ -323,10 +323,33 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                             .get("sessionId")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("");
-                                        info!(
-                                            session_id = %sid,
-                                            "Received session/cancel notification (acknowledged; in-flight cancel not yet implemented)"
-                                        );
+                                        // Flip the in-flight turn's cancel
+                                        // channel (issue #3). The turn's
+                                        // response task observes it, aborts
+                                        // the engine, and answers with
+                                        // stopReason "cancelled". No turn
+                                        // in flight → nothing to do.
+                                        match state
+                                            .turn_registry
+                                            .lock()
+                                            .expect("turn registry lock")
+                                            .get(sid)
+                                        {
+                                            Some((gen, cancel_tx)) => {
+                                                info!(
+                                                    session_id = %sid,
+                                                    generation = gen,
+                                                    "Cancelling in-flight turn"
+                                                );
+                                                let _ = cancel_tx.send(true);
+                                            }
+                                            None => {
+                                                debug!(
+                                                    session_id = %sid,
+                                                    "session/cancel for session without in-flight turn"
+                                                );
+                                            }
+                                        }
                                     }
                                     _ => {
                                         debug!(method, "Ignoring unknown notification");
@@ -392,7 +415,59 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                 }
                             }
                             "session/prompt" => {
-                                handle_acp_prompt(id, &params, &state).await;
+                                // Runs as its own task: the main loop must
+                                // keep reading stdin during a turn, or
+                                // `session/cancel` would sit unread until
+                                // the turn completes (issue #3).
+                                let sid = params
+                                    .get("sessionId")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                // One turn per session at a time: a second
+                                // prompt while a turn runs would race the
+                                // session history (issue #3). The Client
+                                // cancels first if it wants to redirect.
+                                if state
+                                    .turn_registry
+                                    .lock()
+                                    .expect("turn registry lock")
+                                    .contains_key(&sid)
+                                {
+                                    acp::send_error_with_data(
+                                        &id,
+                                        -32001,
+                                        "A turn is already in progress for this session; send session/cancel first",
+                                        json!({ "reason": "turn_in_progress" }),
+                                    );
+                                    continue;
+                                }
+                                let generation = state
+                                    .turn_registry
+                                    .lock()
+                                    .expect("turn registry lock")
+                                    .get(&sid)
+                                    .map(|(g, _)| *g + 1)
+                                    .unwrap_or(0);
+                                let (cancel_tx, cancel_rx) =
+                                    tokio::sync::watch::channel(false);
+                                state
+                                    .turn_registry
+                                    .lock()
+                                    .expect("turn registry lock")
+                                    .insert(sid, (generation, cancel_tx));
+                                let state_task = Arc::clone(&state);
+                                let params_task = params.clone();
+                                tokio::spawn(async move {
+                                    handle_acp_prompt(
+                                        id,
+                                        &params_task,
+                                        &state_task,
+                                        generation,
+                                        cancel_rx,
+                                    )
+                                    .await;
+                                });
                             }
                             "session/end" | "session/close" => {
                                 let session_id = params.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
@@ -594,7 +669,49 @@ async fn shutdown_signal() {
 }
 
 /// Handle ACP session/prompt — runs engine and streams notifications to stdout.
-async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>) {
+///
+/// Runs as its own task (spawned by the main loop) so stdin keeps being
+/// read while the turn executes. Cancellation (issue #3): when the
+/// Client sends `session/cancel`, the cancel handler flips the
+/// session's watch channel; the notification drain selects on it,
+/// aborts the engine task, and responds with `stopReason: "cancelled"`
+/// (spec: the Agent MUST answer the original prompt request with the
+/// cancelled stop reason — Clients must not see cancellation as an
+/// error).
+///
+/// The registry entry created by the main loop before spawning is
+/// removed on every exit path via [`RegistryGuard`].
+async fn handle_acp_prompt(
+    id: RequestId,
+    params: &Value,
+    state: &Arc<AppState>,
+    generation: u64,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    struct RegistryGuard<'a> {
+        state: &'a AppState,
+        session_id: &'a str,
+        generation: u64,
+    }
+    impl Drop for RegistryGuard<'_> {
+        fn drop(&mut self) {
+            let mut registry = self.state.turn_registry.lock().expect("turn registry lock");
+            // Remove only if we still own the entry — a newer turn for
+            // the same session would have replaced it.
+            if registry.get(self.session_id).map(|(g, _)| *g) == Some(self.generation) {
+                registry.remove(self.session_id);
+            }
+        }
+    }
+    let _registry_guard = RegistryGuard {
+        state,
+        session_id: params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        generation,
+    };
+
     let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
@@ -671,30 +788,127 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
         .await
     });
 
-    // Drain notifications to ACP stdout. Each notification is routed
-    // through the `_for` dispatcher so v2 Clients receive v2-shaped
-    // payloads (e.g. `tool_call_update` instead of `tool_call`) and v1
-    // Clients receive the legacy shapes they were written against.
-    while let Some(notif) = notify_rx.recv().await {
-        match notif {
-            Notification::Thinking => acp::notify_thinking_for(state.protocol_version, &session_id),
-            Notification::ThinkingText { text } => acp::notify_thinking_text(&session_id, &text),
-            Notification::ToolStart { id, name, args } => {
-                acp::notify_tool_start_for(state.protocol_version, &session_id, &id, &name, &args)
+    // Drain notifications to ACP stdout, racing the cancel channel.
+    // Each notification is routed through the `_for` dispatcher so v2
+    // Clients receive v2-shaped payloads (e.g. `tool_call_update`
+    // instead of `tool_call`) and v1 Clients receive the legacy shapes
+    // they were written against.
+    let mut cancelled = false;
+    loop {
+        tokio::select! {
+            notif = notify_rx.recv() => {
+                match notif {
+                    Some(Notification::Thinking) => {
+                        acp::notify_thinking_for(state.protocol_version, &session_id)
+                    }
+                    Some(Notification::ThinkingText { text }) => {
+                        acp::notify_thinking_text(&session_id, &text)
+                    }
+                    Some(Notification::ToolStart { id, name, args }) => {
+                        acp::notify_tool_start_for(
+                            state.protocol_version,
+                            &session_id,
+                            &id,
+                            &name,
+                            &args,
+                        )
+                    }
+                    Some(Notification::ToolDone { id, status, result, .. }) => {
+                        acp::notify_tool_done_for(
+                            state.protocol_version,
+                            &session_id,
+                            &id,
+                            &status,
+                            result.as_deref(),
+                        )
+                    }
+                    Some(Notification::TextChunk(text)) => {
+                        acp::notify_text_for(state.protocol_version, &session_id, &text)
+                    }
+                    None => break, // engine task finished; all notifications seen
+                }
             }
-            Notification::ToolDone {
-                id, status, result, ..
-            } => acp::notify_tool_done_for(
-                state.protocol_version,
-                &session_id,
-                &id,
-                &status,
-                result.as_deref(),
-            ),
-            Notification::TextChunk(text) => {
-                acp::notify_text_for(state.protocol_version, &session_id, &text)
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    cancelled = true;
+                    // Abort the engine at its current await point. Any
+                    // in-flight LLM request or tool execution dies here;
+                    // partial round state is discarded (per-round
+                    // persistence means completed rounds survive).
+                    handle.abort();
+                    // Drain whatever the engine managed to send before
+                    // dying so notifications stay on the wire.
+                    while let Ok(notif) = notify_rx.try_recv() {
+                        match notif {
+                            Notification::Thinking => {
+                                acp::notify_thinking_for(
+                                    state.protocol_version,
+                                    &session_id,
+                                )
+                            }
+                            Notification::ThinkingText { text } => {
+                                acp::notify_thinking_text(&session_id, &text)
+                            }
+                            Notification::ToolStart { id, name, args } => {
+                                acp::notify_tool_start_for(
+                                    state.protocol_version,
+                                    &session_id,
+                                    &id,
+                                    &name,
+                                    &args,
+                                )
+                            }
+                            Notification::ToolDone { id, status, result, .. } => {
+                                acp::notify_tool_done_for(
+                                    state.protocol_version,
+                                    &session_id,
+                                    &id,
+                                    &status,
+                                    result.as_deref(),
+                                )
+                            }
+                            Notification::TextChunk(text) => {
+                                acp::notify_text_for(
+                                    state.protocol_version,
+                                    &session_id,
+                                    &text,
+                                )
+                            }
+                        }
+                    }
+                    break;
+                }
             }
         }
+    }
+
+    // De-register the turn regardless of outcome.
+    state
+        .turn_registry
+        .lock()
+        .expect("turn registry lock")
+        .remove(&session_id);
+
+    if cancelled {
+        // Spec (issue #3): respond with the cancelled stop reason —
+        // cancellation is not an error, and the Client MUST see the
+        // prompt request answered. Version dispatch mirrors the normal
+        // response path: v1 keeps the legacy body, v2 reports the turn
+        // end via state_update and answers with messageId only.
+        if state.protocol_version == ProtocolVersion::V2 {
+            acp::notify_state_idle_for(state.protocol_version, &session_id, Some("cancelled"));
+            acp::send_response(&id, json!({ "messageId": message_id }));
+        } else {
+            acp::send_response(
+                &id,
+                json!({
+                    "stopReason": "cancelled",
+                    "status": "cancelled",
+                    "text": "",
+                }),
+            );
+        }
+        return;
     }
 
     let result = handle.await.unwrap_or_else(|_| engine::PromptResult {

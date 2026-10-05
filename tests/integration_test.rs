@@ -11,7 +11,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -849,11 +849,14 @@ async fn test_mid_stream_error_fails_turn_without_retry() {
     let (notifications, response) = h.read_until_response(2);
 
     assert_eq!(response["result"]["status"], "failed");
-    // Exactly one request — no silent round retry.
+    // Two requests: the malformed-body attempt notified zero chunks
+    // (nothing visible to duplicate), so issue #15's bounded silent
+    // retry ran once — and failed the same way. Chunks-before-failure
+    // would still fail fast with exactly one request.
     assert_eq!(
         call_count.load(Ordering::SeqCst),
-        1,
-        "retry would duplicate chunks"
+        2,
+        "expected exactly one silent retry"
     );
 
     // The error text is surfaced as a message chunk with the stable
@@ -2426,6 +2429,390 @@ async fn test_persistence_opt_out_hides_capabilities() {
     }));
     let (_, resp) = h.read_until_response(2);
     assert_eq!(resp["error"]["data"]["reason"], "no_persistence");
+
+    h.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #3: session/cancel actually cancels the in-flight turn
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_session_cancel_aborts_turn_and_reports_cancelled() {
+    // Mock: round 0 streams two chunks then stalls forever (never
+    // [DONE], never EOF) — the engine is stuck mid-round, exactly the
+    // field steering scenario. Cancel must abort the turn and answer
+    // the prompt request with stopReason "cancelled".
+    let port = free_port();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("bind mock");
+    tokio::spawn(async move {
+        let router = Router::new()
+            .route("/v1/models", get(mock_models))
+            .route("/api/tags", get(mock_ollama_tags))
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    let stream = futures_lite::stream::unfold(0u32, |state| async move {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        match state {
+                            0 => Some((
+                                Ok::<_, std::convert::Infallible>(
+                                    "data: {\"choices\":[{\"delta\":{\"content\":\"partial work\"}}]}\n\n"
+                                        .to_string(),
+                                ),
+                                state + 1,
+                            )),
+                            1 => Some((
+                                Ok(
+                                    "data: {\"choices\":[{\"delta\":{\"content\":\" more\"}}]}\n\n"
+                                        .to_string(),
+                                ),
+                                state + 1,
+                            )),
+                            _ => {
+                                // Stall indefinitely — unfinishable
+                                // without cancellation.
+                                std::future::pending::<()>().await;
+                                unreachable!()
+                            }
+                        }
+                    });
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }),
+            );
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    // Spawn the agent directly with a reader thread pushing stdout lines
+    // into a channel — lets the test assert on delivery timing.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_acp-bridge"));
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
+        .env("LLM_MODEL", "test-model")
+        .env("LLM_API_KEY", "test-key");
+    let mut child = cmd.spawn().expect("spawn acp-bridge");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<Value>();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if let Ok(v) = serde_json::from_str::<Value>(buf.trim()) {
+                        if line_tx.send(v).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let send = |stdin: &mut ChildStdin, v: Value| {
+        use std::io::Write;
+        writeln!(stdin, "{}", v).expect("write");
+        stdin.flush().expect("flush");
+    };
+
+    tokio::time::sleep(Duration::from_millis(700)).await; // startup
+
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}),
+    );
+    #[allow(unused_assignments)]
+    let mut sid = String::new();
+    // Read until the session/new response.
+    loop {
+        let v = line_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no session/new response");
+        if v.get("id") == Some(&json!(1)) {
+            sid = v["result"]["sessionId"].as_str().unwrap().to_string();
+            break;
+        }
+    }
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc":"2.0","id":2,"method":"session/prompt",
+            "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"long task"}]}
+        }),
+    );
+
+    // Let the turn stream its chunks.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc":"2.0","method":"session/cancel",
+            "params":{"sessionId":&sid}
+        }),
+    );
+
+    // The prompt request must be answered PROMPTLY (within 5s) with the
+    // cancelled stop reason — not an error, not a hang.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_partial_text = false;
+    let mut response: Option<Value> = None;
+    while response.is_none() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining > Duration::ZERO,
+            "turn was not cancelled within 5s"
+        );
+        let v = line_rx
+            .recv_timeout(remaining)
+            .expect("stream ended before cancel completed");
+        if v.get("id") == Some(&json!(2)) {
+            response = Some(v);
+        } else if v["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            && v["params"]["update"]["content"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("partial work")
+        {
+            saw_partial_text = true;
+        }
+    }
+    let response = response.unwrap();
+    assert!(saw_partial_text, "pre-cancel chunks must reach the client");
+    // v1 shape: stopReason "cancelled", not an error.
+    assert_eq!(response["result"]["stopReason"], "cancelled");
+    assert!(response.get("error").is_none());
+
+    // The registry was cleaned up: a follow-up turn is accepted (not
+    // rejected as turn_in_progress) and is itself cancellable.
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc":"2.0","id":3,"method":"session/prompt",
+            "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"again"}]}
+        }),
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc":"2.0","method":"session/cancel",
+            "params":{"sessionId":&sid}
+        }),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut response3: Option<Value> = None;
+    while response3.is_none() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining > Duration::ZERO,
+            "second turn was not cancelled within 5s"
+        );
+        let v = line_rx.recv_timeout(remaining).expect("stream ended");
+        if v.get("id") == Some(&json!(3)) {
+            response3 = Some(v);
+        }
+    }
+    assert_eq!(response3.unwrap()["result"]["stopReason"], "cancelled");
+
+    // Close stdin FIRST: the agent shuts down on stdin close; waiting
+    // with stdin still open blocked this test until the process was
+    // SIGTERMed externally (the wait() has nothing to reap while the
+    // agent's own stdin-read is still pending — #18's signal handler
+    // turned that external kill into a clean exit, but it was still a
+    // 15-minute hang waiting for it).
+    drop(stdin);
+    let _ = child.wait();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cancel_without_turn_and_concurrent_prompt_guard() {
+    let port = free_port();
+    let mut h = TestHarness::start(port).await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // Cancel with no turn in flight: silently ignored (no crash, no
+    // response — it's a notification).
+    h.send(&json!({
+        "jsonrpc":"2.0","method":"session/cancel",
+        "params":{"sessionId":&sid}
+    }));
+
+    // A normal prompt still works after a stray cancel.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hi"}]}
+    }));
+    let (_, response) = h.read_until_response(2);
+    assert_eq!(response["result"]["status"], "completed");
+
+    // Second prompt while the first is still in flight → clean error.
+    // The mock router finishes instantly, so we cancel-then-prompt
+    // instead to prove the registry was cleaned: after the turn ended,
+    // a new prompt is accepted (not rejected with turn_in_progress).
+    h.send(&json!({
+        "jsonrpc":"2.0","id":3,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"again"}]}
+    }));
+    let (_, response) = h.read_until_response(3);
+    assert_eq!(response["result"]["status"], "completed");
+
+    h.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #15: truncated streams — classification + bounded silent retry
+// ---------------------------------------------------------------------------
+
+/// SSE body that streams `chunks` and then ENDS WITHOUT the `[DONE]`
+/// sentinel — a clean close mid-stream, exactly the field symptom: the
+/// parser must classify it as `StreamTruncated`, never a completed turn.
+fn sse_truncated(chunks: Vec<Value>) -> Response {
+    let mut lines: Vec<String> = chunks
+        .into_iter()
+        .map(|c| format!("data: {}\n\n", c))
+        .collect();
+    // Note: deliberately NO "data: [DONE]".
+    if lines.is_empty() {
+        lines.push("\n".to_string()); // keep the body non-empty but chunkless
+    }
+    let stream =
+        futures_lite::stream::iter(lines.into_iter().map(Ok::<_, std::convert::Infallible>));
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_truncated_stream_retries_silently_when_nothing_notified() {
+    // Attempt 1 truncates before notifying anything (empty SSE body, no
+    // sentinel); the engine's bounded silent retry (issue #15) re-runs
+    // the round, attempt 2 completes. The turn must COMPLETE with the
+    // retry's answer — no error surfaced, exactly two requests.
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let assert_count = call_count.clone();
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(move |req: Request<Body>| {
+                let counter = call_count.clone();
+                async move {
+                    let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    match n {
+                        0 => sse_truncated(vec![]), // nothing notified, no sentinel
+                        _ => sse_response(vec![json!(
+                            {"choices": [{"delta": {"content": "recovered answer"}}]}
+                        )]),
+                    }
+                }
+            }),
+        );
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hi"}]}
+    }));
+    let (notifications, response) = h.read_until_response(2);
+
+    // The turn COMPLETED via the silent retry — no error surface.
+    assert_eq!(response["result"]["status"], "completed");
+    assert_eq!(response["result"]["text"], "recovered answer");
+    assert_eq!(assert_count.load(Ordering::SeqCst), 2);
+    let saw_error_text = notifications.iter().any(|m| {
+        m["params"]["update"]["content"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Error (")
+    });
+    assert!(
+        !saw_error_text,
+        "silent retry must not surface an error: {notifications:?}"
+    );
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_truncated_stream_fails_when_chunks_already_notified() {
+    // The round streams a visible chunk, THEN truncates (EOF, no
+    // sentinel). A retry would duplicate the visible chunk — the turn
+    // must fail with the stream_truncated classification, exactly one
+    // request, and the pre-truncation chunk must have arrived.
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let assert_count = call_count.clone();
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(move |req: Request<Body>| {
+                let counter = call_count.clone();
+                async move {
+                    let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    sse_truncated(vec![json!({
+                        "choices": [{"delta": {"content": "visible before truncation"}}]
+                    })])
+                }
+            }),
+        );
+
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        router,
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hi"}]}
+    }));
+    let (notifications, response) = h.read_until_response(2);
+
+    assert_eq!(response["result"]["status"], "failed");
+    assert_eq!(response["result"]["error"]["category"], "stream_truncated");
+    assert_eq!(assert_count.load(Ordering::SeqCst), 1);
+    assert!(notifications.iter().any(|m| {
+        m["params"]["update"]["content"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("visible before truncation")
+    }));
 
     h.shutdown();
 }

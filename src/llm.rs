@@ -487,6 +487,13 @@ pub enum LlmErrorKind {
     BadRequest,
     /// HTTP 404. Model not found / wrong base URL. Do not retry.
     NotFound,
+    /// The stream died mid-round without its terminal sentinel
+    /// (`[DONE]` / `done: true`) — backend or proxy closed a
+    /// long-running connection. Transport was fine for most of the
+    /// round, so `backend_unreachable` would mislead. Do not retry
+    /// mid-turn (a retry would duplicate already-notified chunks);
+    /// the Client may re-issue the prompt.
+    StreamTruncated,
     /// Client-side request timeout. Retryable.
     Timeout,
     /// Response was not parseable as JSON. Do not retry — repeating
@@ -507,6 +514,7 @@ impl LlmErrorKind {
             Self::Auth => "auth_error",
             Self::BadRequest => "bad_request",
             Self::NotFound => "not_found",
+            Self::StreamTruncated => "stream_truncated",
             Self::Timeout => "timeout",
             Self::ParseError => "parse_error",
             Self::Unknown => "unknown",
@@ -514,6 +522,12 @@ impl LlmErrorKind {
     }
 
     /// Whether the Client should retry the request automatically.
+    ///
+    /// `StreamTruncated` is deliberately NOT retryable here: chunks may
+    /// already be in flight to the Client, so an automatic retry would
+    /// duplicate visible output. The engine's own bounded retry (issue
+    /// #15: only when a round notified zero chunks) handles the safe
+    /// subset internally.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
@@ -1050,7 +1064,7 @@ async fn parse_ollama_native_stream(
     let _ = tx
         .send(StreamChunk::Error(
             "Stream ended before the terminal done:true sentinel".into(),
-            LlmErrorKind::Unreachable,
+            LlmErrorKind::StreamTruncated,
         ))
         .await;
 }
@@ -1178,7 +1192,7 @@ async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Send
     let _ = tx
         .send(StreamChunk::Error(
             "Stream ended before the terminal [DONE] sentinel".into(),
-            LlmErrorKind::Unreachable,
+            LlmErrorKind::StreamTruncated,
         ))
         .await;
 }
