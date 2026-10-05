@@ -264,7 +264,17 @@ Opt in by advertising levels:
 thought_levels = ["low", "high", "max"]
 ```
 
-`session/new` then includes a `thought_level` config option (bb renders it as a reasoning-effort picker; `"max"` displays as "Maximum reasoning effort"). When the user switches levels, bb sends `session/set_config_option` and every subsequent round's request body carries `reasoning_effort: <level>` — overriding any `[llm.request_overrides]` default for that session only. Omit the key (default) and nothing is advertised: the wire is unchanged.
+`session/new` then includes **two** config options: a single-entry
+`model` option and a `thought_level` option. bb's reasoning pipeline
+needs both — it builds its model list from the model option, then
+probes reasoning support by sending `session/set_config_option` with
+`configId: "model"` and reading the thought level back from each
+response. Advertising the level alone results in **no picker** (bb
+takes an early return before the probe). When the user switches
+levels, bb sends `session/set_config_option` and every subsequent
+round's request body carries `reasoning_effort: <level>` — overriding
+any `[llm.request_overrides]` default for that session only. Omit the
+key (default) and nothing is advertised: the wire is unchanged.
 
 ## Mac quick start (Apple Silicon)
 

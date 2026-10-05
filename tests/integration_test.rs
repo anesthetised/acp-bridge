@@ -3025,12 +3025,35 @@ async fn test_thought_level_config_option_flow() {
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
-    // session/new advertises the thought_level option.
-    let option = &resp["result"]["configOptions"][0];
+    // session/new advertises BOTH options: the model option bb's
+    // pipeline builds the model list from, then the thought_level
+    // option its reasoning probe reads back.
+    let model_option = &resp["result"]["configOptions"][0];
+    assert_eq!(model_option["id"], "model");
+    assert_eq!(model_option["category"], "model");
+    let option = &resp["result"]["configOptions"][1];
     assert_eq!(option["id"], "thought_level");
     assert_eq!(option["category"], "thought_level");
     assert_eq!(option["currentValue"], "low");
     assert_eq!(option["options"][2]["value"], "max");
+
+    // bb's reasoning discovery probe (x8/discoverAcpNativeReasoningBy
+    // Model): sends set_config_option with configId "model" and reads
+    // the thought_level option back from the response. Must succeed —
+    // a rejection here is why the picker never appeared.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":9,"method":"session/set_config_option",
+        "params":{"sessionId":&sid,"configId":"model","value":"test-model"}
+    }));
+    let (_, probe_resp) = h.read_until_response(9);
+    assert_eq!(
+        probe_resp["result"]["configOptions"][0]["id"], "model",
+        "model probe must be accepted and echo configOptions, got: {probe_resp:?}"
+    );
+    assert_eq!(
+        probe_resp["result"]["configOptions"][1]["id"],
+        "thought_level"
+    );
 
     // Original turn — starts without the level.
     h.send(&json!({
@@ -3055,7 +3078,7 @@ async fn test_thought_level_config_option_flow() {
     // arrive between the request and its response — seek the response.
     let (_, set_resp) = h.read_until_response(3);
     assert_eq!(
-        set_resp["result"]["configOptions"][0]["currentValue"], "max",
+        set_resp["result"]["configOptions"][1]["currentValue"], "max",
         "set_config_option returns the updated option, got: {set_resp:?}"
     );
 

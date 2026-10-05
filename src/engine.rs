@@ -616,67 +616,122 @@ pub fn thought_level_config_option(state: &AppState, current: Option<&str>) -> O
     }))
 }
 
+/// The `model` config option (issue #13): bb's UI builds its model
+/// list from a `category: "model"` option and then PROBES reasoning
+/// support by sending `session/set_config_option(configId: "model",
+/// value: <model>)` and reading the `thought_level` option back from
+/// the response. Without this option bb takes an early return in its
+/// discovery path and never builds the reasoning-effort picker —
+/// advertising `thought_level` alone is not enough. acp-bridge offers
+/// exactly one model: the configured one.
+fn model_config_option(state: &AppState) -> Value {
+    json!({
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": state.config.model,
+        "options": [{ "value": state.config.model, "name": state.config.model }],
+    })
+}
+
+/// Both options bb's picker pipeline needs, in a fixed order (model
+/// first, thought level second). Called only when the feature is on.
+fn config_options_body(state: &AppState, current_level: Option<&str>) -> Value {
+    json!({
+        "configOptions": [
+            model_config_option(state),
+            thought_level_config_option(state, current_level)
+                .expect("feature is on, so the thought level option exists"),
+        ]
+    })
+}
+
 /// Build the `session/new` success response (issue #13): `sessionId`
 /// plus — when the thought-level feature is configured — the
-/// `configOptions` array bb's picker reads. Without the feature the
-/// response is byte-identical to the historical `{"sessionId"}` shape.
+/// `configOptions` array bb's picker reads (model option + thought
+/// level). Without the feature the response is byte-identical to the
+/// historical `{"sessionId"}` shape.
 pub fn session_new_response(state: &AppState, session_id: &str) -> Value {
     let current = state
         .sessions_read()
         .get(session_id)
         .and_then(|s| s.thought_level.clone());
     let mut body = json!({ "sessionId": session_id });
-    if let Some(option) = thought_level_config_option(state, current.as_deref()) {
-        body["configOptions"] = json!([option]);
+    if !state.config.thought_levels.is_empty() {
+        body["configOptions"] =
+            config_options_body(state, current.as_deref())["configOptions"].clone();
     }
     body
 }
 
-/// Handle `session/set_config_option` (issue #13): validate and store
-/// the per-session reasoning-effort override. Returns the updated
-/// `configOptions` array (bb reads it back), or an error for unknown
-/// sessions / invalid values.
+/// Handle `session/set_config_option` (issue #13): validate and apply
+/// the request, returning the updated `configOptions` array (bb reads
+/// it back — including from the `model` probe responses). Errors for
+/// unknown sessions / invalid values.
 pub fn session_set_config_option(
     state: &AppState,
     session_id: &str,
     config_id: &str,
     value: &Value,
 ) -> Result<Value, AcpError> {
-    if config_id != "thought_level" {
-        return Err(AcpError::InvalidParam {
-            field: format!("configId: unknown config option '{config_id}'"),
-        });
-    }
     if state.config.thought_levels.is_empty() {
         return Err(AcpError::InvalidParam {
             field: "configId: no config options advertised".into(),
         });
     }
-    let Some(level) = value.as_str() else {
-        return Err(AcpError::InvalidParam {
-            field: "value: expected a string thought level".into(),
-        });
-    };
-    if !state.config.thought_levels.iter().any(|l| l == level) {
-        return Err(AcpError::InvalidParam {
-            field: format!(
-                "value: '{level}' is not one of the advertised thought levels: {}",
-                state.config.thought_levels.join(", ")
-            ),
-        });
+    match config_id {
+        // bb's reasoning pipeline probes/selects the model through
+        // configId "model". We offer exactly the configured model, so
+        // a matching value is a no-op selection; anything else was
+        // never advertised.
+        "model" => {
+            let requested = value.as_str().ok_or_else(|| AcpError::InvalidParam {
+                field: "value: expected a string model id".into(),
+            })?;
+            if requested != state.config.model {
+                return Err(AcpError::InvalidParam {
+                    field: format!(
+                        "value: '{requested}' is not offered; this agent runs '{}'",
+                        state.config.model
+                    ),
+                });
+            }
+        }
+        "thought_level" => {
+            let Some(level) = value.as_str() else {
+                return Err(AcpError::InvalidParam {
+                    field: "value: expected a string thought level".into(),
+                });
+            };
+            if !state.config.thought_levels.iter().any(|l| l == level) {
+                return Err(AcpError::InvalidParam {
+                    field: format!(
+                        "value: '{level}' is not one of the advertised thought levels: {}",
+                        state.config.thought_levels.join(", ")
+                    ),
+                });
+            }
+            let mut sessions = state.sessions_write();
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| AcpError::UnknownSession {
+                    session_id: session_id.to_string(),
+                })?;
+            session.thought_level = Some(level.to_string());
+        }
+        other => {
+            return Err(AcpError::InvalidParam {
+                field: format!("configId: unknown config option '{other}'"),
+            });
+        }
     }
 
-    let mut sessions = state.sessions_write();
-    let session = sessions
-        .get_mut(session_id)
-        .ok_or_else(|| AcpError::UnknownSession {
-            session_id: session_id.to_string(),
-        })?;
-    session.thought_level = Some(level.to_string());
-
-    Ok(json!({
-        "configOptions": [thought_level_config_option(state, Some(level)).unwrap_or(Value::Null)]
-    }))
+    let current = state
+        .sessions_read()
+        .get(session_id)
+        .and_then(|s| s.thought_level.clone());
+    Ok(config_options_body(state, current.as_deref()))
 }
 
 pub fn session_new_post_create_notifications(
@@ -1744,6 +1799,31 @@ mod tests {
     }
 
     #[test]
+    fn session_new_advertises_model_and_thought_level() {
+        let mut cfg = cfg_with_image(false);
+        cfg.thought_levels = vec!["low".into(), "high".into(), "max".into()];
+        let state = AppState::new(cfg);
+        state.sessions_write().insert(
+            "s1".into(),
+            Session::new(
+                json!({"role": "system", "content": "x"}),
+                "/tmp".into(),
+                ProtocolVersion::V1,
+            ),
+        );
+
+        let body = session_new_response(&state, "s1");
+        // bb's pipeline needs BOTH: a model option to build the model
+        // list from, and the thought_level option the probe reads back.
+        assert_eq!(body["configOptions"][0]["id"], "model");
+        assert_eq!(body["configOptions"][0]["category"], "model");
+        assert_eq!(body["configOptions"][0]["currentValue"], "m");
+        assert_eq!(body["configOptions"][0]["options"][0]["value"], "m");
+        assert_eq!(body["configOptions"][1]["id"], "thought_level");
+        assert_eq!(body["configOptions"][1]["currentValue"], "low");
+    }
+
+    #[test]
     fn set_config_option_validates_and_stores() {
         let mut cfg = cfg_with_image(false);
         cfg.thought_levels = vec!["low".into(), "high".into(), "max".into()];
@@ -1759,7 +1839,7 @@ mod tests {
         );
 
         // Unknown configId → rejected.
-        let err = session_set_config_option(&state, "s1", "model", &json!("max")).unwrap_err();
+        let err = session_set_config_option(&state, "s1", "fast", &json!("true")).unwrap_err();
         assert!(err.to_string().contains("unknown config option"));
 
         // Unknown session → rejected.
@@ -1776,10 +1856,23 @@ mod tests {
         let err = session_set_config_option(&state, "s1", "thought_level", &json!(3)).unwrap_err();
         assert!(err.to_string().contains("expected a string"));
 
-        // Valid → stored, response carries the updated option.
+        // bb's model probe: configId "model" with the configured model
+        // is accepted (no-op selection) and echoes the full option set.
+        let updated = session_set_config_option(&state, "s1", "model", &json!("m")).unwrap();
+        assert_eq!(updated["configOptions"][0]["id"], "model");
+        assert_eq!(updated["configOptions"][0]["currentValue"], "m");
+        assert_eq!(updated["configOptions"][1]["id"], "thought_level");
+
+        // …but a model we never offered is rejected.
+        let err =
+            session_set_config_option(&state, "s1", "model", &json!("other-model")).unwrap_err();
+        assert!(err.to_string().contains("not offered"), "got: {err}");
+
+        // Valid thought level → stored, response carries the updated
+        // option (index 1: the model option is first).
         let updated =
             session_set_config_option(&state, "s1", "thought_level", &json!("max")).unwrap();
-        assert_eq!(updated["configOptions"][0]["currentValue"], "max");
+        assert_eq!(updated["configOptions"][1]["currentValue"], "max");
         assert_eq!(
             state.sessions_read().get("s1").unwrap().thought_level,
             Some("max".to_string())

@@ -28,8 +28,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Per-session thought levels via `session/set_config_option`** —
   opt-in (`[llm] thought_levels = ["low", "high", "max"]` or
   `LLM_THOUGHT_LEVELS` env): `session/new` advertises a `thought_level`
-  config option, and Clients that speak bb's dynamic-config surface
-  render a reasoning-effort picker. Selecting a level sends
+  config option *plus a single-entry `model` option* — bb's UI builds
+  its reasoning-effort picker by probing the model option and reading
+  the thought level back, so both are required (advertising the level
+  alone yields no picker). Selecting a level sends
   `session/set_config_option`, which stores a per-session override
   applied to every subsequent round's request body as
   `reasoning_effort` — session choice beats `[llm.request_overrides]`
