@@ -395,6 +395,35 @@ impl LlmConfig {
         Backend::from_url(&self.base_url)
     }
 
+    /// Apply the models allowlist (issue #48) to the startup probe's
+    /// fetched list. `None` = unset: advertise everything fetched, with
+    /// the configured model prepended when the probe omitted it. `Some`
+    /// = intersection in **config order** (the user's curation order),
+    /// with the configured model always included — prepended when the
+    /// intersection omits it, which also covers the empty-intersection
+    /// and probe-failure cases (list degrades to the configured model).
+    pub fn apply_models_allowlist(
+        configured: &str,
+        fetched: Vec<String>,
+        allowlist: Option<&[String]>,
+    ) -> Vec<String> {
+        let mut list = match allowlist {
+            None => fetched,
+            Some(allowed) => {
+                let filtered: Vec<String> = allowed
+                    .iter()
+                    .filter(|m| fetched.iter().any(|f| f == *m))
+                    .cloned()
+                    .collect();
+                filtered
+            }
+        };
+        if !list.iter().any(|m| m == configured) {
+            list.insert(0, configured.to_string());
+        }
+        list
+    }
+
     /// Returns true if the base_url points to an Ollama native API (no /v1 suffix).
     pub fn is_ollama_native(&self) -> bool {
         self.backend().is_ollama_native()
@@ -1499,6 +1528,63 @@ mod tests {
                 "{code} should not be retryable"
             );
         }
+    }
+
+    #[test]
+    fn models_allowlist_matrix() {
+        // Issue #48: filter semantics for apply_models_allowlist.
+        let configured = "glm-a";
+        let fetched = || {
+            vec![
+                "glm-a".to_string(),
+                "claude-x".to_string(),
+                "glm-b".to_string(),
+                "flux-image".to_string(),
+            ]
+        };
+
+        // Unset → everything fetched, order preserved.
+        assert_eq!(
+            LlmConfig::apply_models_allowlist(configured, fetched(), None),
+            vec!["glm-a", "claude-x", "glm-b", "flux-image"]
+        );
+
+        // Config order wins over fetch order; configured model is
+        // always included (prepended when the allowlist omits it).
+        assert_eq!(
+            LlmConfig::apply_models_allowlist(
+                configured,
+                fetched(),
+                Some(&["glm-b".to_string(), "claude-x".to_string()]),
+            ),
+            vec!["glm-a", "glm-b", "claude-x"]
+        );
+
+        // Configured model filtered in (prepended, per the invariant).
+        assert_eq!(
+            LlmConfig::apply_models_allowlist(
+                configured,
+                fetched(),
+                Some(&["claude-x".to_string()]),
+            ),
+            vec!["glm-a", "claude-x"]
+        );
+
+        // Empty intersection → configured model only.
+        assert_eq!(
+            LlmConfig::apply_models_allowlist(
+                configured,
+                fetched(),
+                Some(&["nonexistent".to_string()]),
+            ),
+            vec!["glm-a"]
+        );
+
+        // Probe failed (empty fetched) → configured model only.
+        assert_eq!(
+            LlmConfig::apply_models_allowlist(configured, Vec::new(), None),
+            vec!["glm-a"]
+        );
     }
 
     #[test]
