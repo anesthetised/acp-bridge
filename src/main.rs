@@ -73,15 +73,34 @@ async fn main() {
         RunMode::Acp
     };
 
-    // Initialize tracing — writes to stderr, respects RUST_LOG env.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "acp_bridge=info".parse().unwrap()),
-        )
-        .with_target(true)
-        .with_writer(std::io::stderr)
-        .init();
+    // Initialize tracing — stderr by default (stdout is the ACP wire),
+    // or an append-only log file when ACP_LOG_FILE is set. bb's host
+    // daemon swallows agent stderr (bridge INFO/DEBUG lines never reach
+    // ~/.bb logs), so under bb the per-round override lines (#40/#43)
+    // need a file the bridge owns. Zero config-file surface: one env var.
+    let default_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "acp_bridge=info".parse().unwrap());
+    match std::env::var("ACP_LOG_FILE") {
+        Ok(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap_or_else(|e| panic!("ACP_LOG_FILE '{path}' unwritable: {e}"));
+            tracing_subscriber::fmt()
+                .with_env_filter(default_filter)
+                .with_target(true)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+        }
+        Err(_) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(default_filter)
+                .with_target(true)
+                .with_writer(std::io::stderr)
+                .init();
+        }
+    }
 
     // Load config: CLI arg (optional TOML path) → env vars → defaults
     let config_path = args.iter().skip(1).find(|a| !a.starts_with('-')).cloned();
