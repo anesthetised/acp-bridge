@@ -1,3 +1,12 @@
+# Dependency posture (issue #29, decision B — security-only):
+#   - RustSec advisories fail CI via the `audit` job (covers bundled
+#     SQLite C code compiled into the binary). Landed with 5 TLS-stack
+#     vulnerabilities already in the lockfile (rustls / webpki /
+#     quinn-proto) — cleared in the same PR; proof the guard earns its
+#     place on day one.
+#   - Dependabot ALERTS are active (automatic on public repos).
+#   - Version-update PRs are deliberately NOT configured: dependency
+#     restraint is a design property; bumps are reviewed manually.
 name: CI
 
 on:
@@ -57,4 +66,21 @@ jobs:
         # The suite binds ephemeral 127.0.0.1 ports and spawns agent
         # subprocesses; no external services needed (LLM_BASE_URL points
         # at a closed port by default in harnesses).
+
+  # Security audit (issue #29, decision B: security-only posture). No
+  # version-update PRs — dependency restraint is a design property here.
+  # What IS automated: RustSec advisory checks on every push/PR. This is
+  # the guard that matters for `rusqlite` bundled (SQLite's C source is
+  # compiled into the binary; a CVE there ships silently in releases).
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          # Fails the job when a vulnerability matches an entry in
+          # Cargo.lock. Warnings without a category are non-blocking
+          # (unmaintained crates surface as warnings, not failures).
+          token: ${{ secrets.GITHUB_TOKEN }}
 
