@@ -726,14 +726,14 @@ pub async fn session_prompt(
                 }
             }
 
-            if round_error.is_some() {
+            if let Some(err) = round_error.take() {
                 if attempt == 0 && !notified_any {
                     // Nothing reached the Client — a single silent retry
                     // is invisible and strictly better than killing a
                     // long turn (issue #15). Reset accumulators.
                     warn!(
                         attempt,
-                        kind = round_error.as_ref().unwrap().kind.as_str(),
+                        kind = err.kind.as_str(),
                         "Round failed before notifying anything; retrying once"
                     );
                     notified_any = false;
@@ -741,6 +741,7 @@ pub async fn session_prompt(
                     tool_calls.clear();
                     continue;
                 }
+                round_error = Some(err);
                 break;
             }
             break;
