@@ -333,6 +333,8 @@ mod tests {
             session_idle_timeout_secs: 0,
             prompt_supports_image: false,
             context_size: 32768,
+            compaction_threshold: None,
+            compaction_model: None,
             request_overrides: serde_json::Map::new(),
             thought_levels: Vec::new(),
             thought_levels_set: false,

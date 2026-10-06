@@ -46,6 +46,15 @@ max_tool_rounds = 25
 # reasoning_effort = "max"
 # top_p = 0.95
 
+# Context compaction (issue #25): when a round's prompt tokens cross
+# this fraction of the model window (LLM_MODEL_CONTEXT), older rounds
+# are summarized into a rolling note before the next request. Default
+# 0.75; 0 disables. The summarizer uses the configured model unless
+# compaction_model names a cheaper one.
+#
+# compaction_threshold = 0.75
+# compaction_model = "glm-5.3-flash"
+
 # Reasoning-effort levels advertised to Clients as a `thought_level`
 # config option (issue #13, bb's reasoning-effort picker). Defaults
 # to ["low", "medium", "high", "max"] on OpenAI-compatible backends

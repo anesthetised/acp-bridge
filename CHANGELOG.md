@@ -7,6 +7,24 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **Context compaction** — when a round's reported prompt tokens cross
+  a configurable fraction of the context window (default **75%**,
+  `[llm] compaction_threshold`, `0` disables), older conversation
+  rounds are summarized into a rolling note by a single summarizer
+  call (same model by default, or a cheaper dedicated one via
+  `[llm] compaction_model`) before the next request. The recent tail
+  and system prompt are kept verbatim; a lightweight transcript note
+  marks that compaction ran, so "forgetting" is never silent.
+  Summarizer failures degrade to no-op — the turn never breaks.
+
+- **Models allowlist** (`[llm] models`) — filter the advertised model
+  list (issue #48): advertised = backend-reported ∩ allowlist, config
+  order wins, configured model always included. Shrinks bb's picker
+  from 552 entries to the ones you actually use and cuts the
+  discovery-probe storm proportionally.
+
 ### Fixed
 
 - **write_file sandbox hardening** — the write path was weaker than the
