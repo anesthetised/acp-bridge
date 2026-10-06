@@ -274,6 +274,12 @@ pub struct AppState {
     /// `ACP_SESSION_STRICT_MODELS`), `session_restore` refuses
     /// sessions persisted by a different `agent_identity`.
     pub strict_models: bool,
+    /// Background task registry (issue #28): process groups spawned
+    /// via `bash run_in_background`. Shared via `Arc` so the waiter
+    /// tasks and pre-`initialize` clones (idle eviction) all see the
+    /// same registry — the manual `Clone` below must `Arc::clone` it,
+    /// or eviction cleanup would see an empty split.
+    pub tasks: Arc<crate::tasks::TaskRegistry>,
     /// In-flight turn registry for `session/cancel` (issue #3): one
     /// entry per session with a running prompt turn. The value is the
     /// turn's generation counter plus a `watch` channel that the
@@ -316,6 +322,7 @@ impl Clone for AppState {
             store: self.store.clone(),
             agent_identity: self.agent_identity.clone(),
             strict_models: self.strict_models,
+            tasks: Arc::clone(&self.tasks),
             turn_registry: Arc::clone(&self.turn_registry),
             pending_steers: Arc::clone(&self.pending_steers),
         }
@@ -366,6 +373,7 @@ impl AppState {
             store,
             agent_identity,
             strict_models: false,
+            tasks: Arc::new(crate::tasks::TaskRegistry::new()),
             turn_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_steers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
@@ -399,15 +407,37 @@ impl AppState {
         let timeout = Duration::from_secs(timeout_secs);
         let mut sessions = self.sessions_write();
         let before = sessions.len();
+        // Ownership (issue #55): evicted sessions' background tasks die
+        // with them. No notice — there is no turn to attach it to.
+        // Without this, a forgotten server would pin a session forever.
+        let evicted_ids: Vec<String> = sessions
+            .iter()
+            .filter(|(_, s)| s.last_active.elapsed() >= timeout)
+            .map(|(id, _)| id.clone())
+            .collect();
         sessions.retain(|_id, session| session.last_active.elapsed() < timeout);
         let evicted = before - sessions.len();
+        drop(sessions);
         if evicted > 0 {
-            info!(evicted, remaining = sessions.len(), "Evicted idle sessions");
+            let mut killed = 0;
+            for id in &evicted_ids {
+                killed += self.tasks.terminate_session(id).len();
+            }
+            info!(evicted, tasks_killed = killed, "Evicted idle sessions");
         }
     }
 
     /// Clean up all sessions. Returns the number of sessions cleaned.
     pub fn cleanup(&self) -> usize {
+        // Background tasks die with the agent (issue #55): SIGTERM
+        // every group. Graceful-shutdown paths call this before exit.
+        let terminated = self.tasks.terminate_all();
+        if !terminated.is_empty() {
+            info!(
+                count = terminated.len(),
+                "Terminated background tasks on shutdown"
+            );
+        }
         let mut s = self.sessions_write();
         let n = s.len();
         s.clear();
