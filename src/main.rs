@@ -575,9 +575,12 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
             Notification::ToolStart { id, name } => {
                 acp::notify_tool_start_for(state.protocol_version, &session_id, &id, &name)
             }
-            Notification::ToolDone { id, name, status } => {
-                acp::notify_tool_done_for(state.protocol_version, &session_id, &id, &name, &status)
-            }
+            Notification::ToolDone {
+                id,
+                name,
+                status,
+                diff,
+            } => acp::notify_tool_done_with_diff(&session_id, &id, &name, &status, diff.as_ref()),
             Notification::TextChunk(text) => {
                 acp::notify_text_for(state.protocol_version, &session_id, &text)
             }

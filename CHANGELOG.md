@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- File mutation tool updates include ACP diff blocks, capped at 8 KiB of combined old/new text, on both wire versions.
+
 ## [0.9.2] - 2026-10-06
 
 ### Added

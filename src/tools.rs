@@ -2,9 +2,44 @@
 //! All tools are sandboxed to the working directory.
 
 use serde_json::{json, Value};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, warn};
+
+/// Maximum combined old/new UTF-8 text size in an ACP diff block (8 KiB).
+pub const MAX_DIFF_TEXT_BYTES: usize = 8192;
+
+/// Before/after capture for file-mutating tools. Threaded
+/// through `Notification::ToolDone` and emitted on the wire as an ACP
+/// `diff` content block so Clients can render real diffs instead of
+/// "No diff available". Only ever produced on successful mutations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDiff {
+    /// Absolute resolved path of the changed file.
+    pub path: String,
+    /// Previous content — `None` when the tool created the file.
+    pub old_text: Option<String>,
+    pub new_text: String,
+}
+
+/// A tool result plus optional wire-side diff data. `text` is exactly
+/// what the model has always received; `diff` is additive metadata for
+/// the Client's UI.
+#[derive(Debug, Clone)]
+pub struct ToolOutcome {
+    pub text: String,
+    pub diff: Option<ToolDiff>,
+}
+
+impl ToolOutcome {
+    fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            diff: None,
+        }
+    }
+}
 
 /// Maximum file size to read (1 MB).
 const MAX_FILE_SIZE: u64 = 1024 * 1024;
@@ -266,17 +301,22 @@ fn resolve_sandboxed_path(working_dir: &Path, relative_path: &str) -> Option<Pat
 
 /// Execute a tool call and return the result as a string.
 pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String {
+    execute_tool_with_diff(working_dir, name, arguments).text
+}
+
+/// Execute a tool and capture optional diff metadata for ACP clients.
+pub fn execute_tool_with_diff(working_dir: &Path, name: &str, arguments: &Value) -> ToolOutcome {
     match name {
         "read_file" => {
             let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            execute_read_file(working_dir, path)
+            ToolOutcome::text(execute_read_file(working_dir, path))
         }
         "list_dir" => {
             let path = arguments
                 .get("path")
                 .and_then(|v| v.as_str())
                 .unwrap_or(".");
-            execute_list_dir(working_dir, path)
+            ToolOutcome::text(execute_list_dir(working_dir, path))
         }
         "search_code" => {
             let pattern = arguments
@@ -284,14 +324,14 @@ pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let file_glob = arguments.get("file_glob").and_then(|v| v.as_str());
-            execute_search_code(working_dir, pattern, file_glob)
+            ToolOutcome::text(execute_search_code(working_dir, pattern, file_glob))
         }
         "bash" => {
             let command = arguments
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            execute_bash(working_dir, command)
+            ToolOutcome::text(execute_bash(working_dir, command))
         }
         "write_file" => {
             let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -315,9 +355,11 @@ pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String
         }
         "web_fetch" => {
             let url = arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            execute_web_fetch(url)
+            ToolOutcome::text(execute_web_fetch(url))
         }
-        "git_status" => execute_git(working_dir, &["status", "--short", "--branch"]),
+        "git_status" => {
+            ToolOutcome::text(execute_git(working_dir, &["status", "--short", "--branch"]))
+        }
         "git_diff" => {
             let path = arguments.get("path").and_then(|v| v.as_str());
             let staged = arguments
@@ -335,7 +377,7 @@ pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String
                 path_owned = p.to_string();
                 let _ = path_owned; // suppress unused warning if branch not taken
             }
-            execute_git(working_dir, &args)
+            ToolOutcome::text(execute_git(working_dir, &args))
         }
         "git_log" => {
             let max_count = arguments
@@ -356,7 +398,7 @@ pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String
                 args.push(p.into());
             }
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            execute_git(working_dir, &arg_refs)
+            ToolOutcome::text(execute_git(working_dir, &arg_refs))
         }
         "git_commit" => {
             let message = arguments
@@ -391,14 +433,14 @@ pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String
 
             if message.is_empty() {
                 output.push_str("Error: commit message is empty\n");
-                return output;
+                return ToolOutcome::text(output);
             }
 
             let commit = execute_git(working_dir, &["commit", "-m", message]);
             output.push_str(&commit);
-            output
+            ToolOutcome::text(output)
         }
-        _ => format!("Unknown tool: {name}"),
+        _ => ToolOutcome::text(format!("Unknown tool: {name}")),
     }
 }
 
@@ -713,16 +755,16 @@ fn execute_bash(working_dir: &Path, command: &str) -> String {
 /// Maximum size of a file that `write_file` / `edit` will accept.
 const MAX_WRITE_FILE_SIZE: u64 = 5 * 1024 * 1024;
 
-fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) -> String {
+fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) -> ToolOutcome {
     if relative_path.is_empty() {
-        return "Error: path is empty".to_string();
+        return ToolOutcome::text("Error: path is empty");
     }
     if content.len() as u64 > MAX_WRITE_FILE_SIZE {
-        return format!(
+        return ToolOutcome::text(format!(
             "Error: content too large ({} bytes, max {} bytes)",
             content.len(),
             MAX_WRITE_FILE_SIZE
-        );
+        ));
     }
 
     // Resolve relative path against working_dir. Note: unlike read/list,
@@ -736,18 +778,41 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
     // Reject obvious `..` escapes: if any path component is `..`, refuse.
     for component in Path::new(cleaned).components() {
         if matches!(component, std::path::Component::ParentDir) {
-            return format!(
+            return ToolOutcome::text(format!(
                 "Error: path '{}' escapes the working directory",
                 relative_path
-            );
+            ));
         }
     }
 
     if let Some(parent) = target.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            return format!("Error creating parent directory: {e}");
+            return ToolOutcome::text(format!("Error creating parent directory: {e}"));
         }
     }
+
+    // Diff capture: the previous content must be read BEFORE
+    // the write mutates it. Three states: new file → `Some(None)` (wire
+    // `oldText: null`), existing text file within the snapshot cap →
+    // `Some(Some(prev))`, anything uncapturable (binary, unreadable,
+    // oversized) → `None` (no diff block; Clients fall back to text).
+    let diff_old = if content.len() > MAX_DIFF_TEXT_BYTES {
+        None
+    } else if !target.exists() {
+        Some(None)
+    } else if let Some(snapshot_path) = resolve_sandboxed_path(working_dir, relative_path) {
+        // Do not introduce reads outside the existing sandbox.
+        // Bound the snapshot read; invalid UTF-8 cannot describe a text diff.
+        let mut previous = String::new();
+        std::fs::File::open(snapshot_path).ok().and_then(|file| {
+            file.take((MAX_DIFF_TEXT_BYTES + 1) as u64)
+                .read_to_string(&mut previous)
+                .ok()?;
+            (previous.len() + content.len() <= MAX_DIFF_TEXT_BYTES).then_some(Some(previous))
+        })
+    } else {
+        None
+    };
 
     match std::fs::write(&target, content) {
         Ok(()) => {
@@ -756,9 +821,21 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
                 bytes = content.len(),
                 "write_file"
             );
-            format!("wrote {} bytes to {}", content.len(), relative_path)
+            let diff = diff_old.map(|old| ToolDiff {
+                path: target
+                    .canonicalize()
+                    .unwrap_or_else(|_| target.clone())
+                    .display()
+                    .to_string(),
+                old_text: old,
+                new_text: content.to_string(),
+            });
+            ToolOutcome {
+                text: format!("wrote {} bytes to {}", content.len(), relative_path),
+                diff,
+            }
         }
-        Err(e) => format!("Error writing file: {e}"),
+        Err(e) => ToolOutcome::text(format!("Error writing file: {e}")),
     }
 }
 
@@ -766,47 +843,54 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
 /// file at `relative_path`. Fails clearly if `old_text` is missing or
 /// appears more than once — the model should re-read the file and try
 /// again rather than guess.
-fn execute_edit(working_dir: &Path, relative_path: &str, old_text: &str, new_text: &str) -> String {
+fn execute_edit(
+    working_dir: &Path,
+    relative_path: &str,
+    old_text: &str,
+    new_text: &str,
+) -> ToolOutcome {
     if relative_path.is_empty() {
-        return "Error: path is empty".to_string();
+        return ToolOutcome::text("Error: path is empty".to_string());
     }
     if old_text.is_empty() {
-        return "Error: old_text is empty; refusing to do an open-ended replace".to_string();
+        return ToolOutcome::text(
+            "Error: old_text is empty; refusing to do an open-ended replace".to_string(),
+        );
     }
 
     // Use the same sandbox resolver as read_file so we cannot escape.
     let Some(path) = resolve_sandboxed_path(working_dir, relative_path) else {
-        return format!(
+        return ToolOutcome::text(format!(
             "Error: path '{}' is outside the working directory or does not exist",
             relative_path
-        );
+        ));
     };
     if !path.is_file() {
-        return format!("Error: '{}' is not a file", relative_path);
+        return ToolOutcome::text(format!("Error: '{}' is not a file", relative_path));
     }
 
     let original = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(e) => return format!("Error reading file: {e}"),
+        Err(e) => return ToolOutcome::text(format!("Error reading file: {e}")),
     };
 
     let occurrences = original.matches(old_text).count();
     if occurrences == 0 {
-        return format!(
+        return ToolOutcome::text(format!(
             "Error: old_text not found in {}. Re-read the file and provide the exact current text.",
             relative_path
-        );
+        ));
     }
     if occurrences > 1 {
-        return format!(
+        return ToolOutcome::text(format!(
             "Error: old_text appears {} times in {}. Provide a more specific (longer) old_text that matches exactly once.",
             occurrences, relative_path
-        );
+        ));
     }
 
     let patched = original.replacen(old_text, new_text, 1);
     if let Err(e) = std::fs::write(&path, &patched) {
-        return format!("Error writing file: {e}");
+        return ToolOutcome::text(format!("Error writing file: {e}"));
     }
     debug!(
         path = %relative_path,
@@ -814,12 +898,25 @@ fn execute_edit(working_dir: &Path, relative_path: &str, old_text: &str, new_tex
         after = patched.len(),
         "edit"
     );
-    format!(
-        "patched {} ({} bytes -> {} bytes)",
-        relative_path,
-        original.len(),
-        patched.len()
-    )
+    // Diff capture: `edit` is a local replacement, so the
+    // wire diff carries the affected snippet (old_text → new_text), not
+    // the whole file — Clients render the same local change, and the
+    // block stays small enough for the display cap.
+    ToolOutcome {
+        text: format!(
+            "patched {} ({} bytes -> {} bytes)",
+            relative_path,
+            original.len(),
+            patched.len()
+        ),
+        diff: (old_text.len().saturating_add(new_text.len()) <= MAX_DIFF_TEXT_BYTES).then(|| {
+            ToolDiff {
+                path: path.display().to_string(),
+                old_text: Some(old_text.to_string()),
+                new_text: new_text.to_string(),
+            }
+        }),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1134,11 +1231,11 @@ mod tests {
     #[test]
     fn write_file_creates_and_overwrites() {
         let wd = tmpwd();
-        let result = execute_write_file(&wd, "hello.txt", "hi\n");
+        let result = execute_write_file(&wd, "hello.txt", "hi\n").text;
         assert!(result.contains("wrote"), "got: {result}");
         assert_eq!(fs::read_to_string(wd.join("hello.txt")).unwrap(), "hi\n");
 
-        let result = execute_write_file(&wd, "hello.txt", "there\n");
+        let result = execute_write_file(&wd, "hello.txt", "there\n").text;
         assert!(result.contains("wrote"));
         assert_eq!(fs::read_to_string(wd.join("hello.txt")).unwrap(), "there\n");
 
@@ -1146,9 +1243,55 @@ mod tests {
     }
 
     #[test]
+    fn write_file_diff_captures_before_and_after() {
+        // File mutation contract: file mutations carry a renderable diff block.
+        let wd = tmpwd();
+
+        // New file → `oldText: null` (old_text None).
+        let outcome = execute_write_file(&wd, "new.txt", "first\n");
+        let diff = outcome.diff.expect("new-file write must carry a diff");
+        assert_eq!(diff.old_text, None);
+        assert_eq!(diff.new_text, "first\n");
+        // Absolute resolved path.
+        assert!(diff
+            .path
+            .starts_with(wd.canonicalize().unwrap().to_str().unwrap()));
+
+        // Overwrite → previous content captured BEFORE the mutation.
+        let outcome = execute_write_file(&wd, "new.txt", "second\n");
+        let diff = outcome.diff.expect("overwrite must carry a diff");
+        assert_eq!(diff.old_text.as_deref(), Some("first\n"));
+        assert_eq!(diff.new_text, "second\n");
+
+        let _ = fs::remove_dir_all(&wd);
+    }
+
+    #[test]
+    fn edit_diff_carries_snippet_and_absolute_path() {
+        // File mutation contract: `edit` is a local replacement — the wire diff is the
+        // affected snippet (old_text → new_text), not the whole file.
+        let wd = tmpwd();
+        fs::write(wd.join("f.txt"), "alpha beta gamma\n").unwrap();
+
+        let outcome = execute_edit(&wd, "f.txt", "beta", "BETA");
+        let diff = outcome.diff.expect("successful edit must carry a diff");
+        assert_eq!(diff.old_text.as_deref(), Some("beta"));
+        assert_eq!(diff.new_text, "BETA");
+        assert!(diff.path.ends_with("f.txt"));
+        assert!(Path::new(&diff.path).is_absolute());
+
+        // Failed edits carry no diff — there is no change to render.
+        let outcome = execute_edit(&wd, "f.txt", "missing-text", "x");
+        assert!(outcome.diff.is_none());
+        assert!(outcome.text.starts_with("Error"));
+
+        let _ = fs::remove_dir_all(&wd);
+    }
+
+    #[test]
     fn write_file_rejects_parent_dir_traversal() {
         let wd = tmpwd();
-        let result = execute_write_file(&wd, "../escape.txt", "x");
+        let result = execute_write_file(&wd, "../escape.txt", "x").text;
         assert!(result.starts_with("Error"), "got: {result}");
         assert!(!wd.parent().unwrap().join("escape.txt").exists());
 
@@ -1159,7 +1302,7 @@ mod tests {
     fn edit_replaces_unique_match() {
         let wd = tmpwd();
         fs::write(wd.join("f.txt"), "alpha beta gamma").unwrap();
-        let result = execute_edit(&wd, "f.txt", "beta", "BETA");
+        let result = execute_edit(&wd, "f.txt", "beta", "BETA").text;
         assert!(result.contains("patched"), "got: {result}");
         assert_eq!(
             fs::read_to_string(wd.join("f.txt")).unwrap(),
@@ -1173,7 +1316,7 @@ mod tests {
     fn edit_fails_when_old_text_missing() {
         let wd = tmpwd();
         fs::write(wd.join("f.txt"), "alpha beta").unwrap();
-        let result = execute_edit(&wd, "f.txt", "gamma", "GAMMA");
+        let result = execute_edit(&wd, "f.txt", "gamma", "GAMMA").text;
         assert!(result.contains("not found"), "got: {result}");
         assert_eq!(fs::read_to_string(wd.join("f.txt")).unwrap(), "alpha beta");
 
@@ -1184,7 +1327,7 @@ mod tests {
     fn edit_fails_when_old_text_ambiguous() {
         let wd = tmpwd();
         fs::write(wd.join("f.txt"), "x x x").unwrap();
-        let result = execute_edit(&wd, "f.txt", "x", "y");
+        let result = execute_edit(&wd, "f.txt", "x", "y").text;
         assert!(result.contains("appears 3 times"), "got: {result}");
         assert_eq!(fs::read_to_string(wd.join("f.txt")).unwrap(), "x x x");
 
@@ -1195,7 +1338,7 @@ mod tests {
     fn edit_rejects_empty_old_text() {
         let wd = tmpwd();
         fs::write(wd.join("f.txt"), "x").unwrap();
-        let result = execute_edit(&wd, "f.txt", "", "y");
+        let result = execute_edit(&wd, "f.txt", "", "y").text;
         assert!(result.contains("empty"), "got: {result}");
 
         let _ = fs::remove_dir_all(&wd);

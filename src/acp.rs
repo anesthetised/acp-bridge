@@ -146,15 +146,37 @@ pub fn notify_tool_start(session_id: &str, tool_call_id: &str, title: &str) {
 /// completed | failed`. Spec-compliant clients ignore notifications whose
 /// toolCallId they have not seen.
 pub fn notify_tool_done(session_id: &str, tool_call_id: &str, title: &str, status: &str) {
-    send_session_update(
-        session_id,
-        json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": tool_call_id,
-            "title": title,
-            "status": status
-        }),
-    );
+    notify_tool_done_with_diff(session_id, tool_call_id, title, status, None);
+}
+
+pub fn notify_tool_done_with_diff(
+    session_id: &str,
+    tool_call_id: &str,
+    title: &str,
+    status: &str,
+    diff: Option<&crate::tools::ToolDiff>,
+) {
+    let mut body = json!({
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": tool_call_id,
+        "title": title,
+        "status": status
+    });
+    if let Some(diff) = diff {
+        if diff
+            .old_text
+            .as_deref()
+            .map_or(0, str::len)
+            .saturating_add(diff.new_text.len())
+            <= crate::tools::MAX_DIFF_TEXT_BYTES
+        {
+            body["content"] = json!([{
+                "type": "diff", "path": diff.path,
+                "oldText": diff.old_text, "newText": diff.new_text
+            }]);
+        }
+    }
+    send_session_update(session_id, body);
 }
 
 /// One entry in an `agent_plan` notification.

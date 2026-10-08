@@ -203,6 +203,7 @@ pub enum Notification {
         id: String,
         name: String,
         status: String,
+        diff: Option<tools::ToolDiff>,
     },
     TextChunk(String),
 }
@@ -669,11 +670,13 @@ pub async fn session_prompt(
                         id: tool_call_id.to_string(),
                         name: name.into(),
                     });
-                    let result = tools::execute_tool(&working_dir, name, &args);
+                    let outcome = tools::execute_tool_with_diff(&working_dir, name, &args);
+                    let result = outcome.text;
                     notify(Notification::ToolDone {
                         id: tool_call_id.to_string(),
                         name: name.into(),
                         status: "completed".into(),
+                        diff: outcome.diff,
                     });
 
                     debug!(tool = name, result_len = result.len(), "Tool executed");
@@ -742,6 +745,7 @@ pub async fn session_prompt(
         id: format!("llm_chat:{session_id}"),
         name: "llm_chat".into(),
         status: status.into(),
+        diff: None,
     });
 
     // Estimate the current context utilization for `usage_update`. Local
@@ -1177,9 +1181,12 @@ mod tests {
             id: "tc_42".into(),
             name: "read_file".into(),
             status: "completed".into(),
+            diff: None,
         };
         match n {
-            Notification::ToolDone { id, name, status } => {
+            Notification::ToolDone {
+                id, name, status, ..
+            } => {
                 assert_eq!(id, "tc_42");
                 assert_eq!(name, "read_file");
                 assert_eq!(status, "completed");
