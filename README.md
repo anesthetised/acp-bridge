@@ -262,6 +262,28 @@ top_p = 0.95
 
 Overrides are applied **last** (they win over built-in `temperature` / `max_tokens`); reserved engine-owned keys (`model`, `messages`, `stream`, `tools`) are ignored with a warning; Ollama-native bodies get the same top-level merge only (override `options` as a whole object if needed).
 
+#### Background tasks
+
+Long-running commands (servers, watchers, test suites, builds) can run
+detached from the turn: the model calls \`bash\` with
+\`run_in_background: true\`, gets a task id back immediately, and keeps
+working. It inspects output with \`task_output\` (incremental: each call
+returns only what is new since the last read, plus the task's status;
+beyond 50 000 unread bytes it receives the newest tail and a skipped
+count, with the full log path) and stops tasks with \`task_kill\`
+(SIGTERM to the whole process group, SIGKILL after a 3s grace).
+Calling \`task_output\` with no task id lists the session's background
+tasks — useful when earlier conversation (possibly compacted) no
+longer shows which tasks exist.
+
+Lifecycle: cancelling a turn does not touch its background tasks;
+\`session/end\` and \`session/close\` terminate them (announced in the
+transcript first); graceful agent shutdown (stdin EOF, SIGINT/SIGTERM)
+terminates them; idle-evicted sessions' tasks are terminated too. A
+hard-killed agent (SIGKILL, crash) orphans its tasks — OS default —
+with logs named \`acp-bridge-<agent pid>-…\` in the temp dir for
+traceability. Unix only; the on-disk log is not size-capped.
+
 #### Context compaction
 
 When a round's reported prompt tokens cross **75%** of the model window
