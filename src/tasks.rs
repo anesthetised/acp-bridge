@@ -30,12 +30,10 @@ use std::sync::{Arc, Mutex};
 static FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 use std::time::{Duration, Instant};
 
-/// Model-facing read cap for one poll (bytes). Hoisted from the
-/// copy-pasted 50 000 in tools.rs — the model must not receive more
-/// than this per tool result. This is NOT `acp::TOOL_RESULT_MAX`
-/// (8192): that one is the wire display cap applied by
-/// `preview_result` independently.
-pub const MAX_TOOL_OUTPUT: usize = 50_000;
+/// Model-facing read cap for one poll (bytes): `tools::MAX_TOOL_OUTPUT`.
+/// NOT `acp::TOOL_RESULT_MAX` (8192) — that one is the wire display cap
+/// applied by `preview_result` independently.
+use crate::tools::MAX_TOOL_OUTPUT;
 
 /// Production grace period between SIGTERM and SIGKILL. A parameter in
 /// `kill()` so tests can pass ~200ms.
@@ -470,6 +468,19 @@ impl TaskRegistry {
     /// Graceful agent shutdown (#55): every session, everything.
     pub fn terminate_all(&self) -> Vec<TaskInfo> {
         self.terminate_inner(None)
+    }
+
+    /// SIGKILL any process group still alive after the grace period.
+    /// Used by session/end (issue #55): the response is sent
+    /// immediately; this escalation runs in the background.
+    pub async fn escalate(&self, pgids: Vec<u32>, grace: Duration) {
+        tokio::time::sleep(grace).await;
+        for pgid in pgids {
+            if group_alive(pgid) {
+                unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
+                tracing::info!(pgid, "SIGKILL escalation for background task group");
+            }
+        }
     }
 
     fn terminate_inner(&self, session_id: Option<&str>) -> Vec<TaskInfo> {

@@ -111,7 +111,9 @@ const TOOL_RESULT_MAX: usize = 8192;
 /// human-readable title describing what the tool is doing"). The key
 /// argument is baked in so Clients show *what* the tool is doing without
 /// expanding `rawInput` — "Read src/main.rs", not "read_file".
-fn human_tool_title(name: &str, args: &Value) -> String {
+/// Public for tests: the routing-guard invariant asserts every name in
+/// `tool_definitions()` has a title.
+pub fn human_tool_title(name: &str, args: &Value) -> String {
     let arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
     match name {
         "read_file" => format!("Read {}", arg("path")),
@@ -125,8 +127,21 @@ fn human_tool_title(name: &str, args: &Value) -> String {
             if cmd.chars().count() > 60 {
                 shortened.push('…');
             }
-            format!("Bash: {shortened}")
+            let background = args
+                .get("run_in_background")
+                .map(|v| v == &json!(true) || v == &json!("true"))
+                .unwrap_or(false);
+            if background {
+                format!("Bash (background): {shortened}")
+            } else {
+                format!("Bash: {shortened}")
+            }
         }
+        "task_output" => match arg("task_id") {
+            "" => "List background tasks".to_string(),
+            id => format!("Task output {id}"),
+        },
+        "task_kill" => format!("Kill task {}", arg("task_id")),
         "web_fetch" => format!("Fetch {}", arg("url")),
         "git_status" => "Git status".to_string(),
         "git_diff" => "Git diff".to_string(),
@@ -143,6 +158,7 @@ fn tool_locations(args: &Value) -> Option<Vec<Value>> {
     Some(vec![json!({"path": path})])
 }
 
+/// Public for tests (routing guard in engine tests).
 pub fn kind_for_tool(name: &str) -> &'static str {
     match name {
         // File inspection
@@ -151,6 +167,10 @@ pub fn kind_for_tool(name: &str) -> &'static str {
         "write_file" | "edit" => "edit",
         // Shell / command execution
         "shell" | "exec" | "bash" => "execute",
+        // Background-task introspection and control: same grouping
+        // rationale as git_* — Clients with a terminal affordance
+        // group them with bash.
+        "task_output" | "task_kill" => "execute",
         // Search
         "search" | "search_code" | "grep" => "search",
         // Network fetch
