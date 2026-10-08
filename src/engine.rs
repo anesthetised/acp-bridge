@@ -2351,6 +2351,45 @@ mod tests {
         assert_eq!(session.compaction_split(2), Some(3));
         // Everything fits → no split.
         assert_eq!(session.compaction_split(10), None);
+
+        // Round-boundary snap: a naive cut that lands on a `tool`
+        // result must walk back to the assistant that owns it — an
+        // orphaned tool result (its tool_calls summarized away) is
+        // rejected by OpenAI-compatible backends.
+        let mut session = Session::new(
+            json!({"role":"system","content":"s"}),
+            "/tmp".into(),
+            ProtocolVersion::V1,
+        );
+        for m in [
+            json!({"role":"user","content":"u1"}),
+            json!({"role":"assistant","content":"a1","tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role":"tool","content":"r1","tool_call_id":"c1"}),
+            json!({"role":"tool","content":"r2","tool_call_id":"c1"}),
+            json!({"role":"assistant","content":"a2"}),
+            json!({"role":"user","content":"u2"}),
+            json!({"role":"assistant","content":"a3","tool_calls":[{"id":"c2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role":"tool","content":"r3","tool_call_id":"c2"}),
+            json!({"role":"tool","content":"r4","tool_call_id":"c2"}),
+            json!({"role":"assistant","content":"a4"}),
+        ] {
+            session.messages.push(m);
+        }
+        // len = 11 (system + 10), keep = 2 → naive split = 9, which is
+        // tool r4 → snap back to the owning assistant a3 (index 7).
+        assert_eq!(
+            session.compaction_split(1),
+            Some(7),
+            "messages: {:?}",
+            session.messages
+        );
+        // And the tail starts with the assistant, not a tool result.
+        let split = session.compaction_split(1).unwrap();
+        assert_ne!(
+            session.messages[split]["role"].as_str(),
+            Some("tool"),
+            "tail must not start with an orphaned tool result"
+        );
     }
 
     #[tokio::test]

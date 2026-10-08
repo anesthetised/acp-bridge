@@ -163,7 +163,18 @@ impl Session {
         if self.messages.len() <= keep + 1 {
             return None;
         }
-        Some(self.messages.len() - keep)
+        let mut split = self.messages.len() - keep;
+        // Round-boundary snap (issue #25): never cut inside a tool
+        // round. A `tool` result whose assistant tool_calls message got
+        // summarized away is an orphan — OpenAI-compatible backends
+        // reject it with 400. Walk back until the tail starts at a
+        // non-tool message (a user turn or the assistant that owns the
+        // following results).
+        while split > 1 && self.messages[split].get("role").and_then(|r| r.as_str()) == Some("tool")
+        {
+            split -= 1;
+        }
+        Some(split)
     }
 }
 
