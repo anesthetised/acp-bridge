@@ -390,7 +390,7 @@ the matching wire shape from the same code base.
 | Plan (v1) | `plan` | `entries: PlanEntry[]`. Helper is in place; the LLM does not currently auto-emit plans. |
 | Plan (v2) | `plan_update` | Wrapped in `plan: { type: "items", planId, entries[] }` so Clients can track multiple plans independently. |
 | Session info | `session_info_update` | v1 + v2. Carries the session `title`. acp-bridge emits it after `session/new` (defaults to cwd basename) and after each `session/prompt` (first line of user prompt). |
-| Token usage | `usage_update` | v1 + v2. `used` is chars/4 across the session history; `size` from `LLM_MODEL_CONTEXT` (default 32768). |
+| Token usage | `usage_update` | v1 + v2. `used` prefers backend-reported prompt + completion tokens from the final round, falling back to chars/4 across session history; `size` from `LLM_MODEL_CONTEXT` (default 32768). |
 | Slash commands | `available_commands_update` | v1 + v2. Advertises `/read`, `/ls`, `/search`, `/edit`, `/shell`. |
 | Turn end (v2 only) | `state_update` | Emitted at end of each prompt with `state: "idle"` and `stopReason`. v1 Clients ignore this unknown discriminator per the JSON-RPC spec. |
 

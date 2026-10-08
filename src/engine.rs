@@ -567,6 +567,7 @@ pub async fn session_prompt(
     let mut had_error = false;
     let mut got_final_response = false;
     let mut final_text = String::new();
+    let mut turn_usage = None;
     let mut last_error_class: Option<crate::llm::LlmErrorKind> = None;
     let tool_defs = tools::tool_definitions();
 
@@ -590,6 +591,8 @@ pub async fn session_prompt(
 
         match chat_result {
             Ok(response) => {
+                // The latest round contains cumulative prompt context; never sum rounds.
+                turn_usage = llm::extract_usage(&response);
                 let mut tool_calls = backend.extract_tool_calls(&response);
 
                 // Thinking-mode workarounds (0.9.2): reasoning models
@@ -744,19 +747,16 @@ pub async fn session_prompt(
         status: status.into(),
     });
 
-    // Estimate the current context utilization for `usage_update`. Local
-    // backends rarely stream per-turn token counts in a stable shape, so
-    // we estimate by summing the textual length of every message in the
-    // session history and dividing by 4 chars per token (the canonical
-    // LLM rule of thumb). This is intentionally approximate; clients use
-    // it for progress bars and not for cost attribution.
-    let used_tokens = {
-        let sessions = state.sessions_read();
-        sessions
-            .get(session_id)
-            .map(|s| estimate_tokens(&s.messages))
-            .unwrap_or(0)
-    };
+    // Prefer the final round's actual occupancy; estimate when it reports nothing.
+    let used_tokens = turn_usage
+        .map(|(prompt, completion)| prompt.saturating_add(completion))
+        .unwrap_or_else(|| {
+            let sessions = state.sessions_read();
+            sessions
+                .get(session_id)
+                .map(|s| estimate_tokens(&s.messages))
+                .unwrap_or(0)
+        });
 
     PromptResult {
         status: status.into(),
