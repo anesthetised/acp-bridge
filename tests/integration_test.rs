@@ -200,7 +200,19 @@ impl TestHarness {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_acp-bridge"));
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // stderr MUST go to a file, not a pipe: nothing drains a
+            // stderr pipe in this harness, so with RUST_LOG=debug the
+            // agent blocks on its next log write once the 64KB OS pipe
+            // buffer fills — freezing mid-turn with no response (the
+            // multi-minute hangs in test_background_task_full_flow).
+            // A file drains implicitly and stays inspectable.
+            .stderr(Stdio::from(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(std::env::temp_dir().join("acp-test-agent-stderr.log"))
+                    .expect("open agent stderr log"),
+            ))
             .env("LLM_BASE_URL", format!("http://127.0.0.1:{mock_port}/v1"))
             .env("LLM_MODEL", "test-model")
             .env("LLM_API_KEY", "test-key")
@@ -3086,8 +3098,248 @@ async fn test_session_model_selection_flow() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #13: thought-level config options — bb's dynamic-config surface
+// Issue #28: background tasks — tool surface through a real agent (#54)
 // ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_background_task_full_flow() {
+    // Most of #28's acceptance criteria in one flow: spawn returns
+    // immediately and outlives the turn; output is incremental; kill
+    // reaches the group; the wire stays clean JSON-RPC.
+    //
+    // Mock routing is by the last TOOL RESULT; turns are sequenced by
+    // unique user texts so no routing state leaks between phases. Marker
+    // words live in tool-result HEADERS too (they echo the command), so
+    // all assertions run on header-stripped bodies.
+    let go = std::env::temp_dir().join("acp-bg-task-go");
+    let _ = std::fs::remove_file(&go);
+    let go_for_cmd = go.display().to_string();
+
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(|req: Request<Body>| async move {
+                let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                let last_user = body["messages"]
+                    .as_array()
+                    .and_then(|m| m.iter().rev().find(|m| m["role"] == "user"))
+                    .and_then(|m| m["content"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let spawned = body["messages"]
+                    .as_array()
+                    .map(|msgs| {
+                        msgs.iter().any(|m| {
+                            m["role"] == "tool"
+                                && m["content"]
+                                    .as_str()
+                                    .map(|c| c.contains("Started background task"))
+                                    .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+                let (content, tool_call): (Value, Option<Value>) = match last_user.as_str() {
+                    // Spawn once: a spawn result anywhere in context means
+                    // the task exists — re-returning this call would spawn
+                    // one task per tool round (observed: t1..t25).
+                    "spawn" if !spawned => (
+                        Value::Null,
+                        Some(json!({
+                            "id": "call_bg", "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": format!(
+                                    "{{\"command\": \"echo BG_STARTED_MARKER; while [ ! -f {0} ]; do sleep 0.05; done; echo BG_DONE_MARKER\", \"run_in_background\": true}}",
+                                    go_for_cmd
+                                )
+                            }
+                        })),
+                    ),
+                    "spawn" => (Value::String("FINAL".to_string()), None),
+                    "poll" => (
+                        Value::Null,
+                        Some(json!({
+                            "id": "call_out", "type": "function",
+                            "function": {"name": "task_output", "arguments": "{\"task_id\": \"t1\"}"}
+                        })),
+                    ),
+                    "kill" => (
+                        Value::Null,
+                        Some(json!({
+                            "id": "call_kill", "type": "function",
+                            "function": {"name": "task_kill", "arguments": "{\"task_id\": \"t1\"}"}
+                        })),
+                    ),
+                    _ => (Value::String("FINAL".to_string()), None),
+                };
+                let mut message = json!({"role": "assistant", "content": content});
+                if let Some(tc) = &tool_call {
+                    message["tool_calls"] = json!([tc]);
+                }
+                axum::Json(json!({
+                    "choices": [{
+                        "message": message,
+                        "finish_reason": if tool_call.is_some() { "tool_calls" } else { "stop" }
+                    }]
+                }))
+            }),
+        );
+
+    let mut h = TestHarness::start_with_router(router).await;
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let (_, r1) = h.read_until_response(1);
+    let sid = r1["result"]["sessionId"].as_str().unwrap().to_string();
+
+    let prompt = |h: &mut TestHarness, id: u64, text: &str| {
+        h.send(&json!({
+            "jsonrpc":"2.0","id":id,"method":"session/prompt",
+            "params":{"sessionId":sid,"prompt":[{"type":"text","text":text}]}
+        }));
+    };
+    // Bodies of every completed tool result in a turn, header-stripped.
+    let turn_bodies = |h: &mut TestHarness, id: u64| -> Vec<String> {
+        let (notifs, _) = h.read_until_response(id);
+        notifs
+            .iter()
+            .filter(|n| n["params"]["update"]["status"] == "completed")
+            .filter_map(|n| {
+                n["params"]["update"]["rawOutput"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .map(|r| {
+                r.split_once('\n')
+                    .map(|(_, b)| b.to_string())
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+
+    // Full raw results (header + body) of a turn's completed tool calls.
+    let turn_results = |h: &mut TestHarness, id: u64| -> Vec<String> {
+        let (notifs, _) = h.read_until_response(id);
+        notifs
+            .iter()
+            .filter(|n| n["params"]["update"]["status"] == "completed")
+            .filter_map(|n| {
+                n["params"]["update"]["rawOutput"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .collect()
+    };
+
+    // Header-stripped body of one raw result.
+    let body_of = |r: &str| -> String {
+        r.split_once('\n')
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default()
+    };
+
+    // --- Turn 1: spawn. One task (t1); response arrives while it runs. ---
+    eprintln!("[flow] turn 1 spawn");
+    prompt(&mut h, 2, "spawn");
+    let (notifs, _) = h.read_until_response(2);
+    eprintln!("[flow] turn 1 done, notifs={}", notifs.len());
+    let tool_start = notifs.iter().find(|n| {
+        n["params"]["update"]["sessionUpdate"] == "tool_call"
+            || n["params"]["update"]["sessionUpdate"] == "tool_call_update"
+    });
+    assert!(
+        tool_start.is_some(),
+        "spawn must surface a tool_call, got: {notifs:?}"
+    );
+    let title = tool_start.unwrap()["params"]["update"]["title"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        title.contains("Bash (background)"),
+        "background title expected, got: {title}"
+    );
+    let spawn_bodies: Vec<String> = notifs
+        .iter()
+        .filter(|n| n["params"]["update"]["status"] == "completed")
+        .filter_map(|n| {
+            n["params"]["update"]["rawOutput"]
+                .as_str()
+                .map(String::from)
+        })
+        .filter(|r| r.contains("Started background task"))
+        .map(|r| {
+            r.split_once('\n')
+                .map(|(_, b)| b.to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        spawn_bodies.len(),
+        1,
+        "exactly one spawn, got: {spawn_bodies:?}"
+    );
+    // The spawn result body names the log file and the poll/kill tools
+    // (the command line itself is in the result's HEADER line).
+
+    // --- Turn 2: poll → reads BG_STARTED_MARKER (cursor 0 → text). ---
+    prompt(&mut h, 3, "poll");
+    let bodies = turn_bodies(&mut h, 3);
+    assert!(
+        bodies.iter().any(|b| b.contains("BG_STARTED_MARKER")),
+        "first poll must read the task output: {bodies:?}"
+    );
+
+    // --- Release the sentinel, then poll until the exit is reported.
+    // BG_DONE_MARKER arrives in exactly one poll (cursor); the exit
+    // status may lag the output by one reap cycle, so keep polling
+    // until it shows up. ---
+    std::fs::write(&go, "").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut all_bodies: Vec<String> = Vec::new();
+    let mut saw_exit_status = false;
+    while std::time::Instant::now() < deadline && !saw_exit_status {
+        prompt(&mut h, 4, "poll");
+        let results = turn_results(&mut h, 4);
+        // The exit status lives in a result HEADER; the done marker in a
+        // BODY. They can land in different polls (the shell writes the
+        // marker and exits before the waiter's reap is observed), so
+        // they are asserted separately — never co-required in one
+        // result.
+        saw_exit_status = results.iter().any(|r| r.contains("exited with code 0"));
+        all_bodies.extend(results.iter().map(|r| body_of(r)));
+    }
+    assert!(
+        saw_exit_status,
+        "task never reported exit through task_output"
+    );
+    assert!(
+        all_bodies.iter().all(|b| !b.contains("BG_STARTED_MARKER")),
+        "cursor must suppress already-read output: {all_bodies:?}"
+    );
+
+    // --- Kill through the tool (already exited → group signalled). ---
+    eprintln!("[flow] turn 4 kill");
+    prompt(&mut h, 5, "kill");
+    let results = turn_results(&mut h, 5);
+    eprintln!("[flow] turn 4 done");
+    assert!(
+        results.iter().any(|r| r.contains("Terminated task t1")),
+        "kill result: {results:?}"
+    );
+
+    // --- Final plain turn: the wire is still clean JSON-RPC. ---
+    eprintln!("[flow] turn 5 final");
+    prompt(&mut h, 6, "anything");
+    let (_, final_resp) = h.read_until_response(6);
+    eprintln!("[flow] turn 5 done");
+    assert_eq!(final_resp["result"]["stopReason"], "end_turn");
+
+    let _ = std::fs::remove_file(&go);
+    h.shutdown();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_thought_level_config_option_flow() {
@@ -3543,4 +3795,304 @@ async fn test_truncated_stream_fails_when_chunks_already_notified() {
     }));
 
     h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_session_end_terminates_background_tasks_with_notice() {
+    // Issue #55: session/end kills the session's tasks, announcing it
+    // in the transcript BEFORE the response. TERM-ignoring tasks get
+    // SIGKILL escalation in the background — the response must arrive
+    // promptly, not after the grace.
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(|req: Request<Body>| async move {
+                let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                let last_tool_result = body["messages"]
+                    .as_array()
+                    .and_then(|msgs| {
+                        msgs.iter()
+                            .rev()
+                            .find(|m| m["role"] == "tool")
+                            .and_then(|m| m["content"].as_str())
+                            .map(String::from)
+                    });
+                // Route by the last TOOL RESULT so the spawn happens
+                // exactly once (re-returning the spawn call would spawn
+                // one task per tool round — 25 tasks at the round cap).
+                let (content, tool_call): (Value, Option<Value>) = if last_tool_result
+                    .as_deref()
+                    .map(|r| r.contains("Started background task t1"))
+                    .unwrap_or(false)
+                {
+                    // Round 2: the task exists — poll it.
+                    (
+                        Value::Null,
+                        Some(json!({
+                            "id": "call_out", "type": "function",
+                            "function": {"name": "task_output", "arguments": "{\"task_id\": \"t1\"}"}
+                        })),
+                    )
+                } else if last_tool_result
+                    .as_deref()
+                    .map(|r| r.contains("ready"))
+                    .unwrap_or(false)
+                {
+                    // Round 3: `ready` observed — finalize the turn.
+                    (Value::String("FINAL".to_string()), None)
+                } else {
+                    // Round 1: spawn the TERM-ignoring task.
+                    (
+                        Value::Null,
+                        Some(json!({
+                            "id": "call_bg", "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": "{\"command\": \"trap '' TERM; echo ready; while :; do sleep 0.05; done\", \"run_in_background\": true}"
+                            }
+                        })),
+                    )
+                };
+                let mut message = json!({"role": "assistant", "content": content});
+                if let Some(tc) = &tool_call {
+                    message["tool_calls"] = json!([tc]);
+                }
+                axum::Json(json!({
+                    "choices": [{
+                        "message": message,
+                        "finish_reason": if tool_call.is_some() { "tool_calls" } else { "stop" }
+                    }]
+                }))
+            }),
+        );
+
+    let mut h = TestHarness::start_with_router(router).await;
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let (_, r1) = h.read_until_response(1);
+    let sid = r1["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // Spawn a TERM-ignoring task.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":sid,"prompt":[{"type":"text","text":"spawn"}]}
+    }));
+    let (notifs, _) = h.read_until_response(2);
+    let done = notifs
+        .iter()
+        .find(|n| n["params"]["update"]["status"] == "completed")
+        .expect("spawn completion");
+    let result_text = done["params"]["update"]["rawOutput"]
+        .as_str()
+        .or(done["params"]["update"]["content"][0]["text"].as_str())
+        .unwrap_or("");
+    assert!(
+        result_text.contains("Started background task t1"),
+        "{result_text}"
+    );
+    // Extract the task's pgid from the result line for liveness probing.
+    let pid: u32 = result_text
+        .split("(pid ")
+        .nth(1)
+        .and_then(|s| s.split(')').next())
+        .and_then(|s| s.parse().ok())
+        .expect("pid in spawn result");
+    // Wait for `ready` so the trap is installed.
+    let t0 = std::time::Instant::now();
+    let mut saw_ready = false;
+    while t0.elapsed() < std::time::Duration::from_secs(5) {
+        h.send(&json!({
+            "jsonrpc":"2.0","id":10,"method":"session/prompt",
+            "params":{"sessionId":sid,"prompt":[{"type":"text","text":"poll"}]}
+        }));
+        let (n10, _) = h.read_until_response(10);
+        let body = n10
+            .iter()
+            .filter_map(|n| {
+                n["params"]["update"]["rawOutput"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .chain(n10.iter().filter_map(|n| {
+                n["params"]["update"]["content"][0]["text"]
+                    .as_str()
+                    .map(String::from)
+            }))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if body.contains("ready") {
+            saw_ready = true;
+            break;
+        }
+    }
+    assert!(saw_ready, "task output never showed ready");
+
+    // session/end: notice first, then response, promptly.
+    let end_sent = std::time::Instant::now();
+    h.send(&json!({
+        "jsonrpc":"2.0","id":11,"method":"session/end",
+        "params":{"sessionId":sid}
+    }));
+    let (mut drained, resp11) = h.read_until_response(11);
+    drained.push(resp11);
+    let elapsed = end_sent.elapsed();
+    // Find the notice and the response order.
+    let notice_idx = drained
+        .iter()
+        .position(|n| {
+            n["params"]["update"]["sessionUpdate"] == "agent_thought_chunk"
+                && n["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .map(|t| t.contains("background task(s) terminated") && t.contains("t1"))
+                    .unwrap_or(false)
+        })
+        .expect("termination notice must precede the response");
+    let resp_idx = drained
+        .iter()
+        .position(|n| n.get("id") == Some(&json!(11)))
+        .unwrap();
+    assert!(
+        notice_idx < resp_idx,
+        "notice must come before the session/end response"
+    );
+    let notice_text = drained[notice_idx]["params"]["update"]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        notice_text.contains("t1"),
+        "notice names the task: {notice_text}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "session/end must not wait out the grace period, took {elapsed:?}"
+    );
+
+    // The group is dead after the escalation window (SIGTERM ignored
+    // by the task; SIGKILL lands ~3s after the response, in the
+    // background).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    let mut dead = false;
+    while std::time::Instant::now() < deadline {
+        // SAFETY: signal-0 existence probe on the task's group.
+        if unsafe { libc::killpg(pid as i32, 0) != 0 } {
+            dead = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(dead, "task group survived session/end");
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_shutdown_terminates_background_tasks() {
+    // Issue #55: graceful agent shutdown (stdin EOF or SIGTERM) must
+    // terminate background tasks — process_group(0) removes them from
+    // the terminal's Ctrl-C group, so without explicit cleanup every
+    // agent restart under bb would leak its dev servers.
+    let router = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/api/tags", get(mock_ollama_tags))
+        .route(
+            "/v1/chat/completions",
+            post(|req: Request<Body>| async move {
+                let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                let last_tool_result = body["messages"]
+                    .as_array()
+                    .and_then(|msgs| {
+                        msgs.iter()
+                            .rev()
+                            .find(|m| m["role"] == "tool")
+                            .and_then(|m| m["content"].as_str())
+                            .map(String::from)
+                    });
+                let (content, tool_call): (Value, Option<Value>) = if last_tool_result
+                    .as_deref()
+                    .map(|r| r.contains("Started background task t1"))
+                    .unwrap_or(false)
+                {
+                    (Value::String("FINAL".to_string()), None)
+                } else {
+                    (
+                        Value::Null,
+                        Some(json!({
+                            "id": "call_bg", "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": "{\"command\": \"sleep 300\", \"run_in_background\": true}"
+                            }
+                        })),
+                    )
+                };
+                let mut message = json!({"role": "assistant", "content": content});
+                if let Some(tc) = &tool_call {
+                    message["tool_calls"] = json!([tc]);
+                }
+                axum::Json(json!({
+                    "choices": [{
+                        "message": message,
+                        "finish_reason": if tool_call.is_some() { "tool_calls" } else { "stop" }
+                    }]
+                }))
+            }),
+        );
+
+    let mut h = TestHarness::start_with_router(router).await;
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let (_, r1) = h.read_until_response(1);
+    let sid = r1["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // Spawn `sleep 300` in the background, capture its pid.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":sid,"prompt":[{"type":"text","text":"spawn"}]}
+    }));
+    let (notifs, _) = h.read_until_response(2);
+    let done = notifs
+        .iter()
+        .find(|n| n["params"]["update"]["status"] == "completed")
+        .expect("spawn completion");
+    let result_text = done["params"]["update"]["rawOutput"]
+        .as_str()
+        .or(done["params"]["update"]["content"][0]["text"].as_str())
+        .unwrap_or("");
+    let pid: u32 = result_text
+        .split("(pid ")
+        .nth(1)
+        .and_then(|s| s.split(')').next())
+        .and_then(|s| s.parse().ok())
+        .expect("pid in spawn result");
+
+    // Verify it's alive, then close stdin (graceful shutdown path).
+    assert!(
+        unsafe { libc::killpg(pid as i32, 0) == 0 },
+        "task not running after spawn"
+    );
+    let _ = h.child.stdin.take(); // drop stdin → EOF
+    let status = h.child.wait().expect("agent exit");
+    assert!(
+        status.success(),
+        "agent must exit 0 on stdin EOF, got {status}"
+    );
+
+    // The background task must be gone (terminate_all ran in cleanup).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut dead = false;
+    while std::time::Instant::now() < deadline {
+        // SAFETY: signal-0 existence probe.
+        if unsafe { libc::killpg(pid as i32, 0) != 0 } {
+            dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(dead, "background task survived agent shutdown");
 }

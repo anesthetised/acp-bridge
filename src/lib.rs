@@ -16,4 +16,5 @@ pub mod hardware;
 pub mod llm;
 pub mod protocol;
 pub mod session_store;
+pub mod tasks;
 pub mod tools;

@@ -55,12 +55,14 @@ thiserror = "2"
 toml = "0.8"
 url = "2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio-test = "0.4"
 hyper = "1"
 futures-lite = "2"
 axum = "0.8"
-libc = "0.2"
 
 # Release profile tuned for edge / air-gapped deployments — smaller binary,
 # at the cost of longer compile time. Keeps default unwinding so panics

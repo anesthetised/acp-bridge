@@ -9,6 +9,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Background task execution** — \`bash\` accepts
+  \`run_in_background: true\`: the command runs detached in its own
+  process group and the turn continues immediately. The model inspects
+  tasks with \`task_output\` (incremental cursor reads, exit status,
+  no-arg listing for re-discovery) and stops them with \`task_kill\`
+  (SIGTERM group, SIGKILL escalation). Turn cancellation never touches
+  background tasks; \`session/end\`, graceful shutdown and idle
+  eviction terminate them (session/end announces it in the transcript
+  first). Unix only.
+
 - **Context compaction** — when a round's reported prompt tokens cross
   a configurable fraction of the context window (default **75%**,
   `[llm] compaction_threshold`, `0` disables), older conversation

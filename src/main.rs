@@ -11,6 +11,7 @@ use acp_bridge::hardware;
 use acp_bridge::llm;
 use acp_bridge::protocol::{AcpError, JsonRpcRequest, ProtocolVersion, RequestId};
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -609,6 +610,48 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                     // Both share the same implementation:
                                     // remove the in-memory session. No
                                     // persistence, so re-opening is a no-op.
+                                    //
+                                    // Background tasks (issue #55): they
+                                    // belong to the session (pinned
+                                    // decision 3) — one transcript notice
+                                    // before the kill, naming each task;
+                                    // SIGTERM all groups now, SIGKILL
+                                    // escalation in a background task so
+                                    // the response is never delayed.
+                                    let terminated = state.tasks.terminate_session(session_id);
+                                    let live: Vec<&acp_bridge::tasks::TaskInfo> = terminated
+                                        .iter()
+                                        .filter(|t| t.status == acp_bridge::tasks::TaskStatus::Running)
+                                        .collect();
+                                    if !live.is_empty() {
+                                        let mut notice = format!(
+                                            "[acp-bridge: {} background task(s) terminated:",
+                                            live.len()
+                                        );
+                                        for t in &live {
+                                            let _ = write!(
+                                                notice,
+                                                " {} `{}`",
+                                                t.task_id, t.command
+                                            );
+                                        }
+                                        notice.push(']');
+                                        acp::notify_thinking_text(session_id, &notice);
+                                        // Escalation: SIGKILL survivors after
+                                        // the grace, in the background.
+                                        let pgids: Vec<u32> =
+                                            live.iter().map(|t| t.pid).collect();
+                                        // Own the registry Arc: the
+                                        // escalation outlives this loop
+                                        // iteration (and possibly the
+                                        // whole run_acp_loop).
+                                        let registry = Arc::clone(&state.tasks);
+                                        tokio::spawn(async move {
+                                            registry
+                                                .escalate(pgids, acp_bridge::tasks::KILL_GRACE)
+                                                .await;
+                                        });
+                                    }
                                     match engine::session_end(&state, session_id) {
                                         Ok(()) => acp::send_response(&id, json!({"status": "ended"})),
                                         Err(e) => acp::send_error(&id, e.code(), &e.to_string()),

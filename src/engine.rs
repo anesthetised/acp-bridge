@@ -9,6 +9,7 @@ use crate::protocol::{AcpError, Session};
 use crate::tools;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -274,6 +275,12 @@ pub struct AppState {
     /// `ACP_SESSION_STRICT_MODELS`), `session_restore` refuses
     /// sessions persisted by a different `agent_identity`.
     pub strict_models: bool,
+    /// Background task registry (issue #28): process groups spawned
+    /// via `bash run_in_background`. Shared via `Arc` so the waiter
+    /// tasks and pre-`initialize` clones (idle eviction) all see the
+    /// same registry — the manual `Clone` below must `Arc::clone` it,
+    /// or eviction cleanup would see an empty split.
+    pub tasks: Arc<crate::tasks::TaskRegistry>,
     /// In-flight turn registry for `session/cancel` (issue #3): one
     /// entry per session with a running prompt turn. The value is the
     /// turn's generation counter plus a `watch` channel that the
@@ -316,6 +323,7 @@ impl Clone for AppState {
             store: self.store.clone(),
             agent_identity: self.agent_identity.clone(),
             strict_models: self.strict_models,
+            tasks: Arc::clone(&self.tasks),
             turn_registry: Arc::clone(&self.turn_registry),
             pending_steers: Arc::clone(&self.pending_steers),
         }
@@ -366,6 +374,7 @@ impl AppState {
             store,
             agent_identity,
             strict_models: false,
+            tasks: Arc::new(crate::tasks::TaskRegistry::new()),
             turn_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_steers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
@@ -399,15 +408,37 @@ impl AppState {
         let timeout = Duration::from_secs(timeout_secs);
         let mut sessions = self.sessions_write();
         let before = sessions.len();
+        // Ownership (issue #55): evicted sessions' background tasks die
+        // with them. No notice — there is no turn to attach it to.
+        // Without this, a forgotten server would pin a session forever.
+        let evicted_ids: Vec<String> = sessions
+            .iter()
+            .filter(|(_, s)| s.last_active.elapsed() >= timeout)
+            .map(|(id, _)| id.clone())
+            .collect();
         sessions.retain(|_id, session| session.last_active.elapsed() < timeout);
         let evicted = before - sessions.len();
+        drop(sessions);
         if evicted > 0 {
-            info!(evicted, remaining = sessions.len(), "Evicted idle sessions");
+            let mut killed = 0;
+            for id in &evicted_ids {
+                killed += self.tasks.terminate_session(id).len();
+            }
+            info!(evicted, tasks_killed = killed, "Evicted idle sessions");
         }
     }
 
     /// Clean up all sessions. Returns the number of sessions cleaned.
     pub fn cleanup(&self) -> usize {
+        // Background tasks die with the agent (issue #55): SIGTERM
+        // every group. Graceful-shutdown paths call this before exit.
+        let terminated = self.tasks.terminate_all();
+        if !terminated.is_empty() {
+            info!(
+                count = terminated.len(),
+                "Terminated background tasks on shutdown"
+            );
+        }
         let mut s = self.sessions_write();
         let n = s.len();
         s.clear();
@@ -1276,7 +1307,10 @@ pub async fn session_prompt(
                 name: name.into(),
                 args: args.clone(),
             });
-            let outcome = tools::execute_tool(&working_dir, name, &args);
+            // Background tasks (#28) need the session id and the
+            // registry (AppState) — tools::execute_tool is sync and
+            // session-blind, so dispatch routes through the engine.
+            let outcome = dispatch_tool(state, session_id, &working_dir, name, &args).await;
             // Tool failures are signaled by the "Error" prefix of the
             // result text (see tools.rs) — surface them as a real
             // `failed` status instead of unconditional `completed`
@@ -1455,6 +1489,122 @@ pub fn persist_session_snapshot(state: &AppState, session_id: &str) {
     };
     if let Err(e) = store.save(&record) {
         warn!(error = %e, session_id, "Failed to persist session snapshot");
+    }
+}
+
+/// Route a tool call (issue #54): background-task tools go through
+/// the task registry; everything else stays on the sync
+/// `tools::execute_tool` path — the foreground `bash` behavior is
+/// byte-identical when `run_in_background` is absent or false.
+async fn dispatch_tool(
+    state: &AppState,
+    session_id: &str,
+    working_dir: &std::path::Path,
+    name: &str,
+    args: &Value,
+) -> tools::ToolOutcome {
+    let not_found = |id: &str| {
+        tools::ToolOutcome::text(format!(
+            "Error: no such background task '{id}' in this session (background tasks do not \
+             survive agent restarts). Call task_output with no arguments to list tasks."
+        ))
+    };
+    match name {
+        "bash" => {
+            let run_in_background = match args.get("run_in_background") {
+                Some(Value::Bool(b)) => *b,
+                // Models emit both JSON booleans and the string "true".
+                Some(Value::String(s)) => s == "true",
+                _ => false,
+            };
+            if !run_in_background {
+                return tools::execute_tool(working_dir, name, args);
+            }
+            let command = args["command"].as_str().unwrap_or_default().to_string();
+            match state.tasks.spawn(session_id, working_dir, &command) {
+                Ok(info) => tools::ToolOutcome::text(format!(
+                    "Started background task {} (pid {}): {}\n\
+                     Full log: {}\n\
+                     Poll with task_output(task_id=\"{}\"); stop with task_kill(task_id=\"{}\").",
+                    info.task_id,
+                    info.pid,
+                    command,
+                    info.output_path.display(),
+                    info.task_id,
+                    info.task_id
+                )),
+                Err(e) => tools::ToolOutcome::text(format!("Error: {e}")),
+            }
+        }
+        "task_output" => {
+            let Some(task_id) = args.get("task_id").and_then(|v| v.as_str()) else {
+                let tasks = state.tasks.list(session_id);
+                if tasks.is_empty() {
+                    return tools::ToolOutcome::text("No background tasks in this session.");
+                }
+                let mut out = String::new();
+                for t in &tasks {
+                    let _ = writeln!(
+                        &mut out,
+                        "[{}] {} — {} ({}s, log: {})",
+                        t.task_id,
+                        t.status_text(),
+                        t.command,
+                        t.elapsed().as_secs(),
+                        t.output_path.display()
+                    );
+                }
+                return tools::ToolOutcome::text(out);
+            };
+            let command = state
+                .tasks
+                .list(session_id)
+                .iter()
+                .find(|t| t.task_id == task_id)
+                .map(|t| t.command.clone());
+            match state.tasks.read_new(session_id, task_id) {
+                Ok(chunk) => {
+                    let cmd = command.as_deref().unwrap_or("");
+                    tools::ToolOutcome::text(crate::tasks::render_read(&chunk, cmd))
+                }
+                Err(e) if e.starts_with("no such background task") => not_found(task_id),
+                Err(e) => tools::ToolOutcome::text(format!("Error: {e}")),
+            }
+        }
+        "task_kill" => {
+            let Some(task_id) = args.get("task_id").and_then(|v| v.as_str()) else {
+                return tools::ToolOutcome::text("Error: task_kill requires task_id");
+            };
+            let command = state
+                .tasks
+                .list(session_id)
+                .iter()
+                .find(|t| t.task_id == task_id)
+                .map(|t| t.command.clone());
+            match state
+                .tasks
+                .kill(session_id, task_id, crate::tasks::KILL_GRACE)
+                .await
+            {
+                Ok(outcome) => {
+                    let cmd = command.as_deref().unwrap_or("");
+                    let outcome_text: String = match outcome {
+                        crate::tasks::KillOutcome::Terminated => "SIGTERM".into(),
+                        crate::tasks::KillOutcome::EscalatedToKill => "SIGKILL after grace".into(),
+                        crate::tasks::KillOutcome::AlreadyExited => {
+                            "had already exited; signalled its process group to stop \
+                             any remaining children"
+                                .into()
+                        }
+                    };
+                    tools::ToolOutcome::text(format!(
+                        "Terminated task {task_id} ({cmd}): {outcome_text}."
+                    ))
+                }
+                Err(e) => tools::ToolOutcome::text(format!("Error: {e}")),
+            }
+        }
+        _ => tools::execute_tool(working_dir, name, args),
     }
 }
 
@@ -2280,6 +2430,207 @@ mod tests {
         assert!(state.sessions_read().get("s_never").is_none());
     }
 
+    // -- background tasks tool surface (issue #54) ----------------------------
+
+    #[tokio::test]
+    async fn routing_guard_every_advertised_tool_dispatches() {
+        // Advertising a tool the engine can't execute is a wire lie.
+        // Dispatching each with empty args must never yield "Unknown tool:".
+        let state = AppState::new(cfg_with_image(false));
+        state.sessions_write().insert(
+            "s1".into(),
+            Session::new(
+                json!({"role":"system","content":"s"}),
+                "/tmp".into(),
+                ProtocolVersion::V1,
+            ),
+        );
+        for def in tools::tool_definitions() {
+            let name = def["function"]["name"].as_str().unwrap().to_string();
+            let outcome = dispatch_tool(
+                &state,
+                "s1",
+                std::path::Path::new("/tmp"),
+                &name,
+                &json!({}),
+            )
+            .await;
+            assert!(
+                !outcome.text.starts_with("Unknown tool"),
+                "{name} is advertised but not routed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_foreground_unchanged_without_flag() {
+        // Byte-identical foreground path when run_in_background is
+        // absent or false.
+        let state = AppState::new(cfg_with_image(false));
+        let dir = std::env::temp_dir();
+
+        let outcome = dispatch_tool(
+            &state,
+            "s1",
+            &dir,
+            "bash",
+            &json!({"command": "echo hello"}),
+        )
+        .await;
+        assert_eq!(outcome.text.trim(), "hello");
+
+        let outcome = dispatch_tool(
+            &state,
+            "s1",
+            &dir,
+            "bash",
+            &json!({"command": "echo hello", "run_in_background": false}),
+        )
+        .await;
+        assert_eq!(outcome.text.trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn bash_background_returns_task_id_immediately() {
+        let state = AppState::new(cfg_with_image(false));
+        state.sessions_write().insert(
+            "s1".into(),
+            Session::new(
+                json!({"role":"system","content":"s"}),
+                "/tmp".into(),
+                ProtocolVersion::V1,
+            ),
+        );
+        let dir = std::env::temp_dir();
+        // Sentinel-gated so the task is provably still running.
+        let go = dir.join(format!("go-{}", std::process::id()));
+        let _ = std::fs::remove_file(&go);
+
+        let outcome = dispatch_tool(
+            &state,
+            "s1",
+            &dir,
+            "bash",
+            &json!({
+                "command": format!("echo started; while [ ! -f {} ]; do sleep 0.05; done", go.display()),
+                "run_in_background": "true"  // lenient parse: string form
+            }),
+        )
+        .await;
+        assert!(
+            outcome.text.contains("Started background task t1"),
+            "{}",
+            outcome.text
+        );
+
+        // It is listed while running.
+        let listed = dispatch_tool(&state, "s1", &dir, "task_output", &json!({})).await;
+        assert!(listed.text.contains("[t1]"), "{}", listed.text);
+        assert!(listed.text.contains("running"), "{}", listed.text);
+
+        // Incremental read: `started` once.
+        let read =
+            dispatch_tool(&state, "s1", &dir, "task_output", &json!({"task_id": "t1"})).await;
+        assert!(read.text.contains("started"), "{}", read.text);
+
+        // Release the sentinel; poll for exit.
+        std::fs::write(&go, "").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut exited = false;
+        while std::time::Instant::now() < deadline {
+            let read =
+                dispatch_tool(&state, "s1", &dir, "task_output", &json!({"task_id": "t1"})).await;
+            if read.text.contains("exited with code 0") {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(exited, "task never reported exit");
+
+        // Kill: already exited, group signalled for leftovers.
+        let killed =
+            dispatch_tool(&state, "s1", &dir, "task_kill", &json!({"task_id": "t1"})).await;
+        assert!(
+            killed.text.contains("Terminated task t1"),
+            "{}",
+            killed.text
+        );
+
+        let _ = std::fs::remove_file(&go);
+    }
+
+    #[tokio::test]
+    async fn unknown_task_error_mentions_rediscovery() {
+        let state = AppState::new(cfg_with_image(false));
+        let outcome = dispatch_tool(
+            &state,
+            "s1",
+            std::path::Path::new("/tmp"),
+            "task_output",
+            &json!({"task_id": "t9"}),
+        )
+        .await;
+        assert!(
+            outcome.text.contains("no such background task 't9'"),
+            "{}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.contains("do not survive agent restarts"),
+            "{}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.contains("task_output with no arguments"),
+            "{}",
+            outcome.text
+        );
+
+        let killed = dispatch_tool(
+            &state,
+            "s1",
+            std::path::Path::new("/tmp"),
+            "task_kill",
+            &json!({"task_id": "t9"}),
+        )
+        .await;
+        assert!(
+            killed.text.contains("no such background task 't9'"),
+            "{}",
+            killed.text
+        );
+    }
+
+    #[test]
+    fn acp_titles_and_kinds_for_task_tools() {
+        assert_eq!(
+            crate::acp::human_tool_title(
+                "bash",
+                &json!({"command": "npm run dev", "run_in_background": true})
+            ),
+            "Bash (background): npm run dev"
+        );
+        assert_eq!(
+            crate::acp::human_tool_title("bash", &json!({"command": "npm run dev"})),
+            "Bash: npm run dev"
+        );
+        assert_eq!(
+            crate::acp::human_tool_title("task_output", &json!({"task_id": "t1"})),
+            "Task output t1"
+        );
+        assert_eq!(
+            crate::acp::human_tool_title("task_output", &json!({})),
+            "List background tasks"
+        );
+        assert_eq!(
+            crate::acp::human_tool_title("task_kill", &json!({"task_id": "t1"})),
+            "Kill task t1"
+        );
+        assert_eq!(crate::acp::kind_for_tool("task_output"), "execute");
+        assert_eq!(crate::acp::kind_for_tool("task_kill"), "execute");
+    }
+
     // -- compaction (issue #25) ------------------------------------------------
 
     #[test]
@@ -2440,6 +2791,216 @@ mod tests {
         // Recent tail preserved verbatim after the note.
         let tail_json = serde_json::to_string(&s.messages[3..]).unwrap();
         assert!(tail_json.contains("RECENT"), "tail kept: {tail_json}");
+    }
+
+    fn bg_router_with_sentinel() -> (axum::Router, std::path::PathBuf) {
+        let go = std::env::temp_dir().join(format!(
+            "acp-bg-compaction-go-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let go_for_cmd = go.display().to_string();
+        let router: Router = Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(
+                |req: axum::extract::Request<axum::body::Body>| async move {
+                    let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&body_bytes).unwrap();
+                    // One spawn tool call; after any tool result, finalize.
+                    // The summarizer call (system prompt says "summarize
+                    // coding-agent") gets a summary that mentions t1.
+                    let is_summarizer = body["messages"]
+                        .as_array()
+                        .and_then(|m| m.first())
+                        .and_then(|m| m["content"].as_str())
+                        .map(|c| c.contains("summarize coding-agent"))
+                        .unwrap_or(false);
+                    let has_tool_result = body["messages"]
+                        .as_array()
+                        .map(|m| m.iter().any(|m| m["role"] == "tool"))
+                        .unwrap_or(false);
+                    let (content, tool_call): (serde_json::Value, Option<serde_json::Value>) =
+                        if is_summarizer {
+                            (
+                                serde_json::json!(
+                                    "Started background task t1 (BG_TASK_ALIVE); session is \
+                                     about a t1 task; RECENT questions pending."
+                                ),
+                                None,
+                            )
+                        } else if has_tool_result {
+                            (serde_json::json!("FINAL"), None)
+                        } else {
+                            (
+                                serde_json::Value::Null,
+                                Some(serde_json::json!({
+                                    "id": "call_bg", "type": "function",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": serde_json::json!({
+                                            "command": format!(
+                                                "echo BG_TASK_ALIVE; while [ ! -f {0} ]; do sleep 0.05; done",
+                                                go_for_cmd
+                                            ),
+                                            "run_in_background": true
+                                        })
+                                        .to_string()
+                                    }
+                                })),
+                            )
+                        };
+                    let mut message = serde_json::json!({"role": "assistant", "content": content});
+                    if let Some(tc) = &tool_call {
+                        message["tool_calls"] = serde_json::json!([tc]);
+                    }
+                    axum::Json(serde_json::json!({
+                        "choices": [{
+                            "message": message,
+                            "finish_reason": if tool_call.is_some() { "tool_calls" } else { "stop" }
+                        }]
+                    }))
+                },
+            ),
+        );
+        (router, go)
+    }
+
+    #[tokio::test]
+    async fn compaction_leaves_live_tasks_reachable() {
+        // Pinned decision 6 (issue #28/#56): compaction can summarize
+        // away the history that mentioned a task while the task is
+        // still running. The registry is authoritative and the no-arg
+        // listing is the re-discovery path — pinned by this test.
+        let (router, go) = bg_router_with_sentinel();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut cfg = cfg_with_image(false);
+        cfg.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.context_size = 1000;
+        cfg.compaction_threshold = Some(0.1);
+        let state = AppState::new(cfg);
+        state.sessions_write().insert(
+            "s1".into(),
+            Session::new(
+                json!({"role":"system","content":"SYS"}),
+                "/tmp".into(),
+                ProtocolVersion::V1,
+            ),
+        );
+
+        // Start a sentinel-gated task through the tool dispatch.
+        let outcome = dispatch_tool(
+            &state,
+            "s1",
+            std::path::Path::new("/tmp"),
+            "bash",
+            &json!({
+                "command": format!("echo BG_TASK_ALIVE; while [ ! -f {} ]; do sleep 0.05; done", go.display()),
+                "run_in_background": true
+            }),
+        )
+        .await;
+        assert!(
+            outcome.text.contains("Started background task t1"),
+            "{}",
+            outcome.text
+        );
+        let task_pid: u32 = outcome
+            .text
+            .split("(pid ")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .and_then(|s| s.parse().ok())
+            .expect("pid in spawn result");
+        // Drop guard: SIGKILL the task group even on assertion failure
+        // (leaking sleep loops onto CI runners — the #39/#42 lesson).
+        struct KillGuard(u32);
+        impl Drop for KillGuard {
+            fn drop(&mut self) {
+                unsafe { libc::killpg(self.0 as i32, libc::SIGKILL) };
+            }
+        }
+        let _pid_guard = KillGuard(task_pid);
+
+        // Compaction: history mentioning t1 is summarized away.
+        {
+            let mut sessions = state.sessions_write();
+            let s = sessions.get_mut("s1").unwrap();
+            s.messages = vec![
+                json!({"role":"system","content":"SYS"}),
+                json!({"role":"user","content":"start background task t1 please"}),
+                json!({"role":"assistant","content":"started t1"}),
+                json!({"role":"user","content":"RECENT question"}),
+                json!({"role":"assistant","content":"RECENT answer"}),
+            ];
+        }
+        let summary = compact_session(&state, "s1", 3).await.unwrap();
+        assert!(
+            summary.contains("t1"),
+            "the summarizer saw the task mention"
+        );
+
+        // History no longer contains the literal task id.
+        let history = {
+            let sessions = state.sessions_read();
+            serde_json::to_string(&sessions.get("s1").unwrap().messages).unwrap()
+        };
+        assert!(
+            !history.contains("task t1 please"),
+            "compaction must have summarized the task mention: {history}"
+        );
+
+        // The registry is still authoritative: read by id works…
+        let read = dispatch_tool(
+            &state,
+            "s1",
+            std::path::Path::new("/tmp"),
+            "task_output",
+            &json!({"task_id": "t1"}),
+        )
+        .await;
+        assert!(read.text.contains("BG_TASK_ALIVE"), "{}", read.text);
+
+        // …and the no-arg listing finds the live task.
+        let listed = dispatch_tool(
+            &state,
+            "s1",
+            std::path::Path::new("/tmp"),
+            "task_output",
+            &json!({}),
+        )
+        .await;
+        assert!(listed.text.contains("[t1]"), "{}", listed.text);
+
+        // Release the sentinel; the exit is reported through the same path.
+        std::fs::write(&go, "").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let read = dispatch_tool(
+                &state,
+                "s1",
+                std::path::Path::new("/tmp"),
+                "task_output",
+                &json!({"task_id": "t1"}),
+            )
+            .await;
+            if read.text.contains("exited with code 0") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Cleanup.
+        state.tasks.terminate_session("s1");
     }
 
     #[test]

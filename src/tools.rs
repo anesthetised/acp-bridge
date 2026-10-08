@@ -29,7 +29,7 @@ pub struct ToolOutcome {
 }
 
 impl ToolOutcome {
-    fn text(text: impl Into<String>) -> Self {
+    pub fn text(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             diff: None,
@@ -43,6 +43,11 @@ const MAX_FILE_SIZE: u64 = 1024 * 1024;
 const MAX_LIST_DEPTH: usize = 3;
 /// Maximum entries in directory listing.
 const MAX_LIST_ENTRIES: usize = 200;
+/// Model-facing cap for one tool result (bytes). Hoisted from three
+/// copy-pasted 50 000 literals below; tasks.rs re-uses it for the
+/// background-task read cap so every model-facing surface shares one
+/// budget.
+pub const MAX_TOOL_OUTPUT: usize = 50_000;
 
 fn is_ignored_entry(name: &str) -> bool {
     name.starts_with('.') || matches!(name, "node_modules" | "target" | "__pycache__")
@@ -110,16 +115,54 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a bash command and return its output. Use this for running scripts, git commands, or any shell operation. The command runs in the working directory.",
+                "description": "Execute a bash command and return its output. Use this for running scripts, git commands, or any shell operation. The command runs in the working directory. For servers, watchers, and long builds/test suites use run_in_background instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": {
                             "type": "string",
                             "description": "The bash command to execute (e.g. 'ls -la', '/workspace/gbrain-cli.sh list', 'gh pr list')"
+                        },
+                        "run_in_background": {
+                            "type": "boolean",
+                            "description": "Run the command detached and return immediately with a task id. Use for servers, watchers, long builds/test suites. Poll with task_output, stop with task_kill."
                         }
                     },
                     "required": ["command"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task_output",
+                "description": "Return new output from a background task since your last read (incremental: each call returns only what is new) plus its status (running / exit code). Call with no task_id to list this session's background tasks.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The task id returned when the task was started (e.g. 't1'). Omit to list all background tasks of this session."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task_kill",
+                "description": "Stop a background task and its child processes (SIGTERM, then SIGKILL after a short grace).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The task id to stop (e.g. 't1')"
+                        }
+                    },
+                    "required": ["task_id"]
                 }
             }
         }),
@@ -732,8 +775,8 @@ fn execute_bash(working_dir: &Path, command: &str) -> String {
                 "(no output)".to_string()
             } else {
                 // Truncate very long output
-                if result.len() > 50_000 {
-                    result.truncate(50_000);
+                if result.len() > MAX_TOOL_OUTPUT {
+                    result.truncate(MAX_TOOL_OUTPUT);
                     result.push_str("\n... (truncated)");
                 }
                 result
@@ -1101,8 +1144,8 @@ fn execute_web_fetch(url: &str) -> String {
         content_type
     );
     out.push_str(&body);
-    if out.len() > 50_000 {
-        out.truncate(50_000);
+    if out.len() > MAX_TOOL_OUTPUT {
+        out.truncate(MAX_TOOL_OUTPUT);
         out.push_str("\n... (truncated)");
     }
     out
@@ -1236,8 +1279,8 @@ fn execute_git(working_dir: &Path, args: &[&str]) -> String {
     }
     if result.is_empty() {
         "(no output)".to_string()
-    } else if result.len() > 50_000 {
-        result.truncate(50_000);
+    } else if result.len() > MAX_TOOL_OUTPUT {
+        result.truncate(MAX_TOOL_OUTPUT);
         result.push_str("\n... (truncated)");
         result
     } else {
