@@ -64,3 +64,16 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      # Fork PRs have read-only tokens; audit-check reports in logs instead.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
